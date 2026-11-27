@@ -1,0 +1,1817 @@
+//! Embedded Axum Web Server, Asset Delivery, and Dashboard UI.
+
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::{
+    body::{to_bytes, Body},
+    extract::{Request, State},
+    http::StatusCode,
+    response::{Html, IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tower::ServiceExt;
+
+use crate::metrics::{MetricsSnapshot, ProxyMetrics};
+use crate::pac;
+
+pub const DEFAULT_SUPERCELL_MOBILECONFIG: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>DNSSettings</key>
+            <dict>
+                <key>DNSProtocol</key>
+                <string>HTTPS</string>
+                <key>ServerURL</key>
+                <string>https://dns.comss.one/dns-query</string>
+            </dict>
+            <key>OnDemandRules</key>
+            <array>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>WiFi</string>
+                </dict>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>Cellular</string>
+                </dict>
+                <dict>
+                    <key>Action</key>
+                    <string>Disconnect</string>
+                </dict>
+            </array>
+            <key>PayloadDescription</key>
+            <string>Настройка DNS over HTTPS для прямого подключения в Brawl Stars, Clash Royale и Clash of Clans</string>
+            <key>PayloadDisplayName</key>
+            <string>COMSS Gaming DNS (Brawl Stars &amp; Clash Royale)</string>
+            <key>PayloadIdentifier</key>
+            <string>com.apple.dnsSettings.managed.comss.gaming</string>
+            <key>PayloadType</key>
+            <string>com.apple.dnsSettings.managed</string>
+            <key>PayloadUUID</key>
+            <string>C5B28A14-9E3F-4D78-812C-3A0F56B7D891</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>ProhibitDisablement</key>
+            <false/>
+        </dict>
+    </array>
+    <key>PayloadDescription</key>
+    <string>Игровой DNS-профиль для подключения в Clash Royale, Brawl Stars и Clash of Clans</string>
+    <key>PayloadDisplayName</key>
+    <string>Supercell Gaming DNS (Clash Royale / Brawl Stars)</string>
+    <key>PayloadIdentifier</key>
+    <string>com.supercell.gaming.dns.profile</string>
+    <key>PayloadOrganization</key>
+    <string>COMSS.ONE</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>F721A0C9-5D83-4E61-B91A-82E054C137F4</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
+"#;
+
+pub const DEFAULT_NULLS_MOBILECONFIG: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>DNSSettings</key>
+            <dict>
+                <key>DNSProtocol</key>
+                <string>TLS</string>
+                <key>ServerName</key>
+                <string>dns.nullsproxy.com</string>
+            </dict>
+            <key>OnDemandRules</key>
+            <array>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>WiFi</string>
+                </dict>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>Cellular</string>
+                </dict>
+                <dict>
+                    <key>Action</key>
+                    <string>Disconnect</string>
+                </dict>
+            </array>
+            <key>PayloadDescription</key>
+            <string>Настройка DNS over TLS (Null's Proxy) для Supercell игр</string>
+            <key>PayloadDisplayName</key>
+            <string>Null's Proxy Gaming DNS (DoT)</string>
+            <key>PayloadIdentifier</key>
+            <string>com.apple.dnsSettings.managed.nullsproxy.gaming</string>
+            <key>PayloadType</key>
+            <string>com.apple.dnsSettings.managed</string>
+            <key>PayloadUUID</key>
+            <string>B21CE26F-66C9-42DF-873E-B7D3A2865539</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>ProhibitDisablement</key>
+            <false/>
+        </dict>
+    </array>
+    <key>PayloadDescription</key>
+    <string>Официальный профиль Null's Proxy для Supercell игр</string>
+    <key>PayloadDisplayName</key>
+    <string>Null's Proxy DNS (Brawl Stars)</string>
+    <key>PayloadIdentifier</key>
+    <string>com.nullsproxy.dns.profile</string>
+    <key>PayloadOrganization</key>
+    <string>Null's Team</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>9CBFD31C-60F3-47CA-B1EA-C74895BA64DB</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
+"#;
+
+pub const DEFAULT_YANDEX_MOBILECONFIG: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>DNSSettings</key>
+            <dict>
+                <key>DNSProtocol</key>
+                <string>TLS</string>
+                <key>ServerName</key>
+                <string>common.dot.dns.yandex.net</string>
+            </dict>
+            <key>OnDemandRules</key>
+            <array>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>WiFi</string>
+                </dict>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>Cellular</string>
+                </dict>
+                <dict>
+                    <key>Action</key>
+                    <string>Disconnect</string>
+                </dict>
+            </array>
+            <key>PayloadDescription</key>
+            <string>Шифрованный DNS over TLS (Яндекс DNS) для защиты от подмены ответов провайдером</string>
+            <key>PayloadDisplayName</key>
+            <string>Yandex Safe DNS (DoT)</string>
+            <key>PayloadIdentifier</key>
+            <string>com.apple.dnsSettings.managed.yandex.dot</string>
+            <key>PayloadType</key>
+            <string>com.apple.dnsSettings.managed</string>
+            <key>PayloadUUID</key>
+            <string>A8E4B210-4D3C-489B-9E12-7F3A11C9D001</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>ProhibitDisablement</key>
+            <false/>
+        </dict>
+    </array>
+    <key>PayloadDescription</key>
+    <string>Профиль шифрованного DNS (DNS-over-TLS) от Яндекса для iPhone и iPad</string>
+    <key>PayloadDisplayName</key>
+    <string>Yandex Safe DNS (DoT)</string>
+    <key>PayloadIdentifier</key>
+    <string>com.zapretbridge.yandex.dns.profile</string>
+    <key>PayloadOrganization</key>
+    <string>Zapret TV Bridge</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>E3C71920-6B5A-4A4E-8F21-9A0C44E8B002</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>
+"#;
+
+#[derive(Clone, Debug)]
+pub struct WebConfig {
+    pub proxy_port: u16,
+    pub default_ip: String,
+    pub base_dir: PathBuf,
+    pub tg_port: u16,
+    pub tg_secret: String,
+    pub start_time: Instant,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            proxy_port: 8080,
+            default_ip: pac::get_local_ip(),
+            base_dir: PathBuf::from("."),
+            tg_port: 1443,
+            tg_secret: "00000000000000000000000000000000".to_string(),
+            start_time: Instant::now(),
+        }
+    }
+}
+
+impl WebConfig {
+    pub fn new(
+        proxy_port: u16,
+        default_ip: String,
+        base_dir: PathBuf,
+        tg_port: u16,
+        tg_secret: String,
+        start_time: Instant,
+    ) -> Self {
+        Self {
+            proxy_port,
+            default_ip,
+            base_dir,
+            tg_port,
+            tg_secret,
+            start_time,
+        }
+    }
+
+    pub fn default_with_port(proxy_port: u16) -> Self {
+        let mut cfg = Self::default();
+        cfg.proxy_port = proxy_port;
+        cfg
+    }
+}
+
+pub struct WebState {
+    pub metrics: Arc<ProxyMetrics>,
+    pub config: WebConfig,
+    pub router: Option<Arc<crate::router::SmartRouter>>,
+    contours_cache: parking_lot::RwLock<Option<(Instant, ContoursStatus)>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ContoursStatus {
+    pub zapret_active: bool,
+    pub zapret_strategy: String,
+    pub gateway_active: bool,
+    pub http_port: u16,
+    pub socks5_port: u16,
+    pub socks5_active: bool,
+    pub tg_active: bool,
+    pub tg_port: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SystemStatusResponse {
+    pub contours: ContoursStatus,
+    pub stats: StatsResponse,
+    #[serde(default)]
+    pub update_version: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RulesListResponse {
+    pub target: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct AddRuleRequest {
+    pub domain: String,
+    pub mode: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AddRuleResponse {
+    pub ok: bool,
+    pub domain: String,
+    pub mode: String,
+    pub message: String,
+}
+
+impl WebState {
+    pub fn contours_status(&self) -> ContoursStatus {
+        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+        {
+            let guard = self.contours_cache.read();
+            if let Some((taken_at, ref cached)) = *guard {
+                if taken_at.elapsed() < CACHE_TTL {
+                    return cached.clone();
+                }
+            }
+        }
+
+        let (zapret_active, zapret_strategy) =
+            crate::menu::query_zapret_service_fast().unwrap_or((false, String::new()));
+        let socks5_active = crate::access::is_tcp_port_listening(1080);
+        let tg_active = crate::access::is_tcp_port_listening(self.config.tg_port);
+
+        let fresh = ContoursStatus {
+            zapret_active,
+            zapret_strategy,
+            gateway_active: true,
+            http_port: self.config.proxy_port,
+            socks5_port: 1080,
+            socks5_active,
+            tg_active,
+            tg_port: self.config.tg_port,
+        };
+
+        *self.contours_cache.write() = Some((Instant::now(), fresh.clone()));
+        fresh
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HealthResponse {
+    pub status: String,
+    pub service: String,
+    pub version: String,
+    pub uptime_seconds: u64,
+    pub uptime_secs: u64,
+    pub metrics: MetricsSnapshot,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StatsResponse {
+    pub active_connections: u64,
+    pub total_connections: u64,
+    pub bytes_client_to_remote: u64,
+    pub bytes_remote_to_client: u64,
+    pub errors_count: u64,
+    pub uptime_seconds: u64,
+}
+
+/// Creates the Axum router for local requests (without mutable domain rules API).
+pub fn create_web_router(metrics: Arc<ProxyMetrics>, config: WebConfig) -> Router {
+    create_web_router_with_router(metrics, config, None)
+}
+
+/// Creates the Axum router with live access to `SmartRouter` for runtime rule edits.
+pub fn create_web_router_with_router(
+    metrics: Arc<ProxyMetrics>,
+    config: WebConfig,
+    smart_router: Option<Arc<crate::router::SmartRouter>>,
+) -> Router {
+    let state = Arc::new(WebState {
+        metrics,
+        config,
+        router: smart_router,
+        contours_cache: parking_lot::RwLock::new(None),
+    });
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/health/", get(health_handler))
+        .route("/favicon.ico", get(favicon_handler))
+        .route("/proxy.pac", get(pac_handler))
+        .route("/proxy.pac/", get(pac_handler))
+        .route("/anticensority.pac", get(pac_handler))
+        .route("/anticensority.pac/", get(pac_handler))
+        .route("/pac", get(pac_handler))
+        .route("/pac/", get(pac_handler))
+        .route("/wpad.dat", get(pac_handler))
+        .route("/wpad.dat/", get(pac_handler))
+        .route("/PROXY.PAC", get(pac_handler))
+        .route("/Proxy.Pac", get(pac_handler))
+        .route(
+            "/supercell.mobileconfig",
+            get(mobileconfig_supercell_handler),
+        )
+        .route(
+            "/brawlstars.mobileconfig",
+            get(mobileconfig_supercell_handler),
+        )
+        .route(
+            "/clashroyale.mobileconfig",
+            get(mobileconfig_supercell_handler),
+        )
+        .route("/comss.mobileconfig", get(mobileconfig_supercell_handler))
+        .route("/nullsproxy.mobileconfig", get(mobileconfig_nulls_handler))
+        .route("/yandexdns.mobileconfig", get(mobileconfig_yandex_handler))
+        .route("/dns.mobileconfig", get(mobileconfig_yandex_handler))
+        .route("/api/stats", get(stats_handler))
+        .route("/api/stats/", get(stats_handler))
+        .route("/stats", get(stats_handler))
+        .route("/api/status", get(system_status_handler))
+        .route("/api/status/", get(system_status_handler))
+        .route("/api/rules", get(rules_list_handler).post(rules_add_handler))
+        .route("/api/rules/", get(rules_list_handler).post(rules_add_handler))
+        .route("/", get(dashboard_handler))
+        .route("/index.html", get(dashboard_handler))
+        .fallback(fallback_404)
+        .with_state(state)
+}
+
+async fn health_handler(State(state): State<Arc<WebState>>) -> Json<HealthResponse> {
+    let elapsed = state.config.start_time.elapsed().as_secs();
+    Json(HealthResponse {
+        status: "ok".to_string(),
+        service: "ZapretTVBridge".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_seconds: elapsed,
+        uptime_secs: elapsed,
+        metrics: state.metrics.snapshot(),
+    })
+}
+
+async fn favicon_handler() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn pac_handler(State(state): State<Arc<WebState>>, req: Request) -> Response {
+    let host_header = req.headers().get("host").and_then(|v| v.to_str().ok());
+    let (host, port) = pac::resolve_proxy_target(
+        host_header,
+        None,
+        &state.config.default_ip,
+        state.config.proxy_port,
+    );
+
+    let script = pac::generate_served_pac(&host, port, &state.config.base_dir);
+    let cl = script.len().to_string();
+    (
+        [
+            (
+                "Content-Type",
+                "application/x-ns-proxy-autoconfig; charset=utf-8",
+            ),
+            ("Cache-Control", "no-cache, no-store, must-revalidate"),
+            ("Pragma", "no-cache"),
+            ("Expires", "0"),
+            ("Content-Length", cl.as_str()),
+        ],
+        script,
+    )
+        .into_response()
+}
+
+async fn serve_mobileconfig(
+    state: Arc<WebState>,
+    req: Request,
+    disk_filename: &str,
+    embedded_default: &str,
+    download_filename: &str,
+) -> Response {
+    let disk_path = state.config.base_dir.join(disk_filename);
+    let content = if disk_path.exists() {
+        tokio::fs::read_to_string(&disk_path)
+            .await
+            .unwrap_or_else(|_| embedded_default.to_string())
+    } else {
+        embedded_default.to_string()
+    };
+
+    let is_ios = req
+        .headers()
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|ua| ua.contains("iPhone") || ua.contains("iPad") || ua.contains("Mobile"))
+        .unwrap_or(false);
+
+    let disposition = if is_ios {
+        format!("inline; filename=\"{download_filename}\"")
+    } else {
+        format!("attachment; filename=\"{download_filename}\"")
+    };
+
+    let cl = content.len().to_string();
+    (
+        [
+            (
+                "Content-Type",
+                "application/x-apple-aspen-config; charset=utf-8",
+            ),
+            ("Content-Disposition", disposition.as_str()),
+            ("Cache-Control", "no-cache, no-store, must-revalidate"),
+            ("Content-Length", cl.as_str()),
+        ],
+        content,
+    )
+        .into_response()
+}
+
+async fn mobileconfig_supercell_handler(
+    State(state): State<Arc<WebState>>,
+    req: Request,
+) -> Response {
+    serve_mobileconfig(
+        state,
+        req,
+        "supercell.mobileconfig",
+        DEFAULT_SUPERCELL_MOBILECONFIG,
+        "Supercell_Gaming_COMSS.mobileconfig",
+    )
+    .await
+}
+
+async fn mobileconfig_nulls_handler(
+    State(state): State<Arc<WebState>>,
+    req: Request,
+) -> Response {
+    serve_mobileconfig(
+        state,
+        req,
+        "nullsproxy.mobileconfig",
+        DEFAULT_NULLS_MOBILECONFIG,
+        "NullsProxy_Gaming.mobileconfig",
+    )
+    .await
+}
+
+async fn mobileconfig_yandex_handler(
+    State(state): State<Arc<WebState>>,
+    req: Request,
+) -> Response {
+    serve_mobileconfig(
+        state,
+        req,
+        "yandexdns.mobileconfig",
+        DEFAULT_YANDEX_MOBILECONFIG,
+        "Yandex_Safe_DNS_DoT.mobileconfig",
+    )
+    .await
+}
+
+async fn stats_handler(State(state): State<Arc<WebState>>) -> Json<StatsResponse> {
+    let snap = state.metrics.snapshot();
+    let uptime = state.config.start_time.elapsed().as_secs();
+    Json(StatsResponse {
+        active_connections: snap.active_connections,
+        total_connections: snap.total_connections,
+        bytes_client_to_remote: snap.bytes_client_to_remote,
+        bytes_remote_to_client: snap.bytes_remote_to_client,
+        errors_count: snap.errors_count,
+        uptime_seconds: uptime,
+    })
+}
+
+async fn system_status_handler(State(state): State<Arc<WebState>>) -> Json<SystemStatusResponse> {
+    let snap = state.metrics.snapshot();
+    let uptime = state.config.start_time.elapsed().as_secs();
+    let contours = state.contours_status();
+    let update_version = crate::updater::peek_cached_update().map(|r| r.tag_name);
+    Json(SystemStatusResponse {
+        contours,
+        stats: StatsResponse {
+            active_connections: snap.active_connections,
+            total_connections: snap.total_connections,
+            bytes_client_to_remote: snap.bytes_client_to_remote,
+            bytes_remote_to_client: snap.bytes_remote_to_client,
+            errors_count: snap.errors_count,
+            uptime_seconds: uptime,
+        },
+        update_version,
+    })
+}
+
+async fn rules_list_handler(State(state): State<Arc<WebState>>) -> Response {
+    let Some(ref router) = state.router else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(RulesListResponse {
+                target: Vec::new(),
+                exclude: Vec::new(),
+            }),
+        )
+            .into_response();
+    };
+    let (target, exclude) = router.list_user_rules();
+    Json(RulesListResponse { target, exclude }).into_response()
+}
+
+async fn rules_add_handler(
+    State(state): State<Arc<WebState>>,
+    Json(payload): Json<AddRuleRequest>,
+) -> Response {
+    let Some(ref router) = state.router else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(AddRuleResponse {
+                ok: false,
+                domain: String::new(),
+                mode: payload.mode,
+                message: "Роутер недоступен".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    let exclude = match payload.mode.trim().to_ascii_lowercase().as_str() {
+        "exclude" | "direct" => true,
+        "target" | "route" | "" => false,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AddRuleResponse {
+                    ok: false,
+                    domain: String::new(),
+                    mode: payload.mode,
+                    message: "Режим должен быть target или exclude".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+    let mode_label = if exclude { "exclude" } else { "target" }.to_string();
+    match router.add_user_domain(&payload.domain, exclude) {
+        Ok(domain) => Json(AddRuleResponse {
+            ok: true,
+            domain,
+            mode: mode_label,
+            message: "Правило сохранено и применено".to_string(),
+        })
+        .into_response(),
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(AddRuleResponse {
+                ok: false,
+                domain: payload.domain,
+                mode: mode_label,
+                message: msg.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn dashboard_handler(State(state): State<Arc<WebState>>, req: Request) -> Html<String> {
+    let host_header = req.headers().get("host").and_then(|v| v.to_str().ok());
+    let (host, port) = pac::resolve_proxy_target(
+        host_header,
+        None,
+        &state.config.default_ip,
+        state.config.proxy_port,
+    );
+
+    let snap = state.metrics.snapshot();
+    let uptime = state.config.start_time.elapsed().as_secs();
+    let contours = state.contours_status();
+    Html(render_dashboard_html(
+        &host,
+        port,
+        state.config.tg_port,
+        &state.config.tg_secret,
+        uptime,
+        &snap,
+        &contours,
+    ))
+}
+
+async fn fallback_404() -> (StatusCode, [(&'static str, &'static str); 2], &'static str) {
+    (
+        StatusCode::NOT_FOUND,
+        [
+            ("Content-Type", "text/plain; charset=utf-8"),
+            ("Connection", "close"),
+        ],
+        "404 Not Found",
+    )
+}
+
+/// Dispatches an inbound HTTP request to the Axum web router and writes response to client.
+pub async fn handle_local_request(
+    mut client: TcpStream,
+    method: &str,
+    path: &str,
+    headers: &[httparse::Header<'_>],
+    body_payload: &[u8],
+    router: Router,
+) -> io::Result<()> {
+    // Normalize path: extract clean relative URI if absolute URI was provided
+    let clean_uri = if let Some(idx) = path.find("://") {
+        if let Some(slash_idx) = path[idx + 3..].find('/') {
+            &path[idx + 3 + slash_idx..]
+        } else {
+            "/"
+        }
+    } else {
+        path
+    };
+
+    let mut req_builder = axum::http::Request::builder().method(method).uri(clean_uri);
+
+    for h in headers.iter() {
+        if let Ok(name) = axum::http::header::HeaderName::from_bytes(h.name.as_bytes()) {
+            req_builder = req_builder.header(name, h.value);
+        }
+    }
+
+    let body = if body_payload.is_empty() {
+        Body::empty()
+    } else {
+        Body::from(body_payload.to_vec())
+    };
+
+    let req = match req_builder.body(body) {
+        Ok(r) => r,
+        Err(e) => {
+            let err_resp =
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = client.write_all(err_resp.as_bytes()).await;
+            let _ = client.flush().await;
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
+        }
+    };
+
+    let resp = router
+        .oneshot(req)
+        .await
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+
+    write_response(&mut client, resp).await
+}
+
+/// Serializes an Axum HTTP response to an async byte stream.
+pub async fn write_response<S: AsyncWriteExt + Unpin>(
+    stream: &mut S,
+    response: Response,
+) -> io::Result<()> {
+    let status = response.status();
+    let reason = status.canonical_reason().unwrap_or("");
+    let (parts, body) = response.into_parts();
+    let body_bytes = to_bytes(body, 16 * 1024 * 1024)
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+    let mut out = format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason);
+    let mut has_content_length = false;
+    let mut has_connection = false;
+
+    for (name, val) in parts.headers.iter() {
+        if name.as_str().eq_ignore_ascii_case("content-length") {
+            has_content_length = true;
+        }
+        if name.as_str().eq_ignore_ascii_case("connection") {
+            has_connection = true;
+        }
+        out.push_str(name.as_str());
+        out.push_str(": ");
+        out.push_str(val.to_str().unwrap_or(""));
+        out.push_str("\r\n");
+    }
+
+    if status != StatusCode::NO_CONTENT && !has_content_length {
+        out.push_str(&format!("Content-Length: {}\r\n", body_bytes.len()));
+    }
+    if !has_connection {
+        out.push_str("Connection: close\r\n");
+    }
+    out.push_str("\r\n");
+
+    stream.write_all(out.as_bytes()).await?;
+    if !body_bytes.is_empty() {
+        stream.write_all(&body_bytes).await?;
+    }
+    stream.flush().await?;
+    Ok(())
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn format_bytes_human(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} Б")
+    } else if b < MB {
+        format!("{:.1} КБ", b / KB)
+    } else if b < GB {
+        format!("{:.2} МБ", b / MB)
+    } else {
+        format!("{:.2} ГБ", b / GB)
+    }
+}
+
+fn format_uptime_human(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}ч {m:02}м {s:02}с")
+    } else if m > 0 {
+        format!("{m}м {s:02}с")
+    } else {
+        format!("{s}с")
+    }
+}
+
+fn render_dashboard_html(
+    ip: &str,
+    proxy_port: u16,
+    tg_port: u16,
+    tg_secret: &str,
+    uptime_secs: u64,
+    metrics: &MetricsSnapshot,
+    contours: &ContoursStatus,
+) -> String {
+    let clean_tg_secret = crate::menu::format_telegram_secret(tg_secret);
+
+    let active_contours_count =
+        (contours.zapret_active as u8) + (contours.gateway_active as u8) + (contours.tg_active as u8);
+    let overall_badge_cls = if active_contours_count == 3 {
+        "badge"
+    } else {
+        "badge badge-warn"
+    };
+    let overall_badge_text = format!("РАБОТАЕТ &bull; {active_contours_count}/3");
+
+    let zapret_cls = if contours.zapret_active {
+        "contour-pill on"
+    } else {
+        "contour-pill off"
+    };
+    let zapret_label = if contours.zapret_active {
+        if contours.zapret_strategy.is_empty() {
+            "АКТИВНА".to_string()
+        } else {
+            format!("АКТИВНА &bull; {}", escape_html(&contours.zapret_strategy))
+        }
+    } else if !contours.zapret_strategy.is_empty() {
+        format!(
+            "ОСТАНОВЛЕНА ({})",
+            escape_html(&contours.zapret_strategy)
+        )
+    } else {
+        "ОСТАНОВЛЕНА".to_string()
+    };
+
+    let gw_label = if contours.socks5_active {
+        format!(
+            "АКТИВЕН &bull; :{proxy_port} / SOCKS5 :{}",
+            contours.socks5_port
+        )
+    } else {
+        format!("АКТИВЕН &bull; :{proxy_port} (HTTP+SOCKS5)")
+    };
+
+    let tg_cls = if contours.tg_active {
+        "contour-pill on"
+    } else {
+        "contour-pill off"
+    };
+    let tg_label = if contours.tg_active {
+        format!("АКТИВЕН &bull; :{tg_port}")
+    } else {
+        format!("ОСТАНОВЛЕН &bull; :{tg_port}")
+    };
+
+    let uptime_human = format_uptime_human(uptime_secs);
+    let up_human = format_bytes_human(metrics.bytes_client_to_remote);
+    let down_human = format_bytes_human(metrics.bytes_remote_to_client);
+    let update_banner = if let Some(rel) = crate::updater::peek_cached_update() {
+        format!(
+            r#"<div id="update-banner" style="background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; color: #bae6fd;">🚀 Доступно обновление <strong>{}</strong> — откройте <code>service.bat</code> (пункт <strong>9</strong>) для автоматического обновления.</div>"#,
+            escape_html(&rel.tag_name)
+        )
+    } else {
+        r#"<div id="update-banner" style="display: none; background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; color: #bae6fd;"></div>"#.to_string()
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zapret TV & Mobile Bridge</title>
+<style>
+  :root {{
+    --bg: #090d16;
+    --card-bg: #131b2e;
+    --card-sub: #1e293b;
+    --accent: #38bdf8;
+    --accent-hover: #0284c7;
+    --text: #f1f5f9;
+    --text-muted: #94a3b8;
+    --border: #334155;
+    --success: #10b981;
+    --warn: #f59e0b;
+    --tg: #229ed9;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 24px 16px;
+    line-height: 1.6;
+    display: flex;
+    justify-content: center;
+  }}
+  .container {{
+    max-width: 640px;
+    width: 100%;
+  }}
+  .card {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    margin-bottom: 20px;
+  }}
+  .header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    gap: 10px;
+  }}
+  h1 {{
+    font-size: 22px;
+    color: var(--accent);
+    font-weight: 700;
+  }}
+  .badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    background: rgba(16, 185, 129, 0.2);
+    color: var(--success);
+    border: 1px solid var(--success);
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+  }}
+  .badge::before {{
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 8px var(--success);
+  }}
+  .badge.badge-warn {{
+    background: rgba(245, 158, 11, 0.16);
+    color: var(--warn);
+    border-color: var(--warn);
+  }}
+  .badge.badge-warn::before {{
+    background: var(--warn);
+    box-shadow: 0 0 8px var(--warn);
+  }}
+  .contours-box {{
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }}
+  .contour-row {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 13px;
+    flex-wrap: wrap;
+  }}
+  .contour-name {{
+    color: #cbd5e1;
+    font-weight: 600;
+  }}
+  .contour-pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }}
+  .contour-pill::before {{
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    display: inline-block;
+  }}
+  .contour-pill.on {{
+    background: rgba(16, 185, 129, 0.15);
+    color: #34d399;
+    border: 1px solid rgba(16, 185, 129, 0.35);
+  }}
+  .contour-pill.on::before {{
+    background: #10b981;
+    box-shadow: 0 0 6px #10b981;
+  }}
+  .contour-pill.off {{
+    background: rgba(245, 158, 11, 0.12);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+  }}
+  .contour-pill.off::before {{
+    background: #f59e0b;
+  }}
+  .desc {{
+    font-size: 14px;
+    color: var(--text-muted);
+    margin-bottom: 20px;
+  }}
+  .section {{
+    background: var(--card-sub);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+    border: 1px solid rgba(255,255,255,0.05);
+  }}
+  .section-title {{
+    font-size: 16px;
+    font-weight: 600;
+    color: #e2e8f0;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }}
+  .val-row {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #0f172a;
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin-top: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 14px;
+    word-break: break-all;
+  }}
+  .val-row code {{
+    color: var(--accent);
+  }}
+  .copy-btn {{
+    background: #334155;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-left: 10px;
+    white-space: nowrap;
+    transition: background 0.2s;
+  }}
+  .copy-btn:hover {{
+    background: #475569;
+  }}
+  .btn {{
+    display: inline-block;
+    background: var(--accent);
+    color: #0f172a;
+    font-weight: 700;
+    padding: 10px 16px;
+    border-radius: 8px;
+    text-decoration: none;
+    font-size: 14px;
+    transition: background 0.2s, transform 0.1s;
+    text-align: center;
+    cursor: pointer;
+    border: none;
+  }}
+  .btn:hover {{
+    background: var(--accent-hover);
+    color: #fff;
+  }}
+  .btn-tg {{
+    background: var(--tg);
+    color: #fff;
+  }}
+  .btn-tg:hover {{
+    background: #1d8bc0;
+  }}
+  .btn-group {{
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }}
+  .info-text {{
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-top: 8px;
+  }}
+  .tab-nav {{
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+  }}
+  .tab-btn {{
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    padding: 7px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    transition: all 0.2s;
+  }}
+  .tab-btn:hover {{
+    background: rgba(255,255,255,0.06);
+    color: var(--text);
+  }}
+  .tab-btn.active {{
+    background: var(--accent);
+    color: #0f172a;
+    border-color: var(--accent);
+  }}
+  .tab-pane {{
+    display: none;
+  }}
+  .tab-pane.active {{
+    display: block;
+  }}
+  .stats-grid {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 12px;
+  }}
+  .stat-box {{
+    background: rgba(0,0,0,0.25);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    text-align: center;
+  }}
+  .stat-num {{
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+  }}
+  .stat-label {{
+    font-size: 11px;
+    color: var(--text-muted);
+  }}
+  footer {{
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 20px;
+  }}
+</style>
+<script>
+function copyText(val, btn) {{
+  navigator.clipboard.writeText(val).then(() => {{
+    const old = btn.innerText;
+    btn.innerText = "Скопировано!";
+    setTimeout(() => {{ btn.innerText = old; }}, 1800);
+  }}).catch(() => {{
+    prompt("Скопируйте вручную:", val);
+  }});
+}}
+
+function handleTgClick(e, tgUrl, host, port, secret) {{
+  window.location.href = tgUrl;
+  navigator.clipboard.writeText(tgUrl).then(() => {{
+    const toast = document.getElementById("tg-toast");
+    if (toast) {{
+      toast.style.display = "block";
+      setTimeout(() => {{ toast.style.display = "none"; }}, 6000);
+    }}
+  }}).catch(() => {{}});
+  return true;
+}}
+
+function handleProfileClick(e, path, profileName) {{
+  const ua = navigator.userAgent || '';
+  const isIOS = /iPhone|iPad|iPod/i.test(ua);
+  const isNonSafariIOS = isIOS && (/EdgiOS|CriOS|FxiOS|DuckDuckGo/i.test(ua) || !/Version\/.*Safari/i.test(ua));
+
+  if (isNonSafariIOS) {{
+    e.preventDefault();
+    const fullUrl = window.location.origin + path;
+    navigator.clipboard.writeText(fullUrl).then(() => {{
+      alert("⚠️ На iPhone установка DNS-профилей блокируется Apple в сторонних браузерах (Edge, Chrome) и разрешена ТОЛЬКО в Safari!\n\nПрямая ссылка скопирована в буфер:\n" + fullUrl + "\n\nИнструкция:\n1. Откройте приложение Safari на iPhone.\n2. Вставьте скопированную ссылку в адресную строку Safari и перейдите.\n3. Safari спросит «Разрешить загрузку профиля?» -> нажмите «Разрешить».\n4. Перейдите в «Настройки iPhone -> Профиль загружен -> Установить».");
+    }}).catch(() => {{
+      alert("⚠️ На iPhone профили (.mobileconfig) устанавливаются ТОЛЬКО через Safari!\n\nПожалуйста, откройте Safari и перейдите по адресу:\n" + window.location.origin + path);
+    }});
+    return false;
+  }}
+  return true;
+}}
+
+function switchSupercellTab(tab) {{
+  const androidPane = document.getElementById('sc-pane-android');
+  const iosPane = document.getElementById('sc-pane-ios');
+  const androidBtn = document.getElementById('sc-tab-android');
+  const iosBtn = document.getElementById('sc-tab-ios');
+  if (!androidPane || !iosPane) return;
+  if (tab === 'ios') {{
+    androidPane.classList.remove('active');
+    iosPane.classList.add('active');
+    if (androidBtn) androidBtn.classList.remove('active');
+    if (iosBtn) iosBtn.classList.add('active');
+  }} else {{
+    iosPane.classList.remove('active');
+    androidPane.classList.add('active');
+    if (iosBtn) iosBtn.classList.remove('active');
+    if (androidBtn) androidBtn.classList.add('active');
+  }}
+}}
+
+function formatBytes(b) {{
+  if (b < 1024) return b + ' Б';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' КБ';
+  if (b < 1073741824) return (b / 1048576).toFixed(2) + ' МБ';
+  return (b / 1073741824).toFixed(2) + ' ГБ';
+}}
+
+function formatUptime(secs) {{
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  const pad = (n) => String(n).padStart(2, '0');
+  if (h > 0) return h + 'ч ' + pad(m) + 'м ' + pad(s) + 'с';
+  if (m > 0) return m + 'м ' + pad(s) + 'с';
+  return s + 'с';
+}}
+
+function refreshSystemStatus() {{
+  fetch('/api/status', {{ cache: 'no-store' }})
+    .then((r) => r.ok ? r.json() : null)
+    .then((data) => {{
+      if (!data || !data.contours || !data.stats) return;
+      const c = data.contours;
+      const st = data.stats;
+      const count = (c.zapret_active ? 1 : 0) + (c.gateway_active ? 1 : 0) + (c.tg_active ? 1 : 0);
+
+      const badge = document.getElementById('overall-badge');
+      if (badge) {{
+        badge.className = count === 3 ? 'badge' : 'badge badge-warn';
+        badge.textContent = 'РАБОТАЕТ • ' + count + '/3';
+      }}
+
+      const zEl = document.getElementById('cnt-zapret');
+      if (zEl) {{
+        zEl.className = c.zapret_active ? 'contour-pill on' : 'contour-pill off';
+        if (c.zapret_active) {{
+          zEl.textContent = c.zapret_strategy ? ('АКТИВНА • ' + c.zapret_strategy) : 'АКТИВНА';
+        }} else {{
+          zEl.textContent = c.zapret_strategy ? ('ОСТАНОВЛЕНА (' + c.zapret_strategy + ')') : 'ОСТАНОВЛЕНА';
+        }}
+      }}
+
+      const gEl = document.getElementById('cnt-gateway');
+      if (gEl) {{
+        gEl.className = c.gateway_active ? 'contour-pill on' : 'contour-pill off';
+        gEl.textContent = c.socks5_active
+          ? ('АКТИВЕН • :' + c.http_port + ' / SOCKS5 :' + c.socks5_port)
+          : ('АКТИВЕН • :' + c.http_port + ' (HTTP+SOCKS5)');
+      }}
+
+      const tEl = document.getElementById('cnt-tg');
+      if (tEl) {{
+        tEl.className = c.tg_active ? 'contour-pill on' : 'contour-pill off';
+        tEl.textContent = (c.tg_active ? 'АКТИВЕН • :' : 'ОСТАНОВЛЕН • :') + c.tg_port;
+      }}
+
+      const upTimeEl = document.getElementById('stat-uptime');
+      if (upTimeEl) upTimeEl.textContent = formatUptime(st.uptime_seconds);
+      const actEl = document.getElementById('stat-active');
+      if (actEl) actEl.textContent = st.active_connections;
+      const totEl = document.getElementById('stat-total');
+      if (totEl) totEl.textContent = st.total_connections;
+      const bUp = document.getElementById('stat-up');
+      if (bUp) bUp.textContent = formatBytes(st.bytes_client_to_remote);
+      const bDown = document.getElementById('stat-down');
+      if (bDown) bDown.textContent = formatBytes(st.bytes_remote_to_client);
+
+      const uEl = document.getElementById('update-banner');
+      if (uEl && data.update_version) {{
+        uEl.style.display = 'block';
+        uEl.innerHTML = '🚀 Доступно обновление <strong>' + data.update_version.replace(/[<>&"]/g, '') + '</strong> — откройте <code>service.bat</code> (пункт <strong>9</strong>).';
+      }}
+    }})
+    .catch(() => {{}});
+}}
+
+function loadUserRules() {{
+  fetch('/api/rules', {{ cache: 'no-store' }})
+    .then((r) => r.ok ? r.json() : null)
+    .then((data) => {{
+      const box = document.getElementById('rules-list');
+      if (!box || !data) return;
+      const t = (data.target || []).slice(0, 12).map((d) => '<code>+ ' + d + '</code>');
+      const e = (data.exclude || []).slice(0, 12).map((d) => '<code>- ' + d + '</code>');
+      box.innerHTML = (t.length + e.length) > 0
+        ? ('<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;">' + t.concat(e).join('') + '</div>')
+        : '<span class="info-text">Пользовательские правила пока пусты.</span>';
+    }})
+    .catch(() => {{}});
+}}
+
+function addUserRule(mode) {{
+  const input = document.getElementById('rule-domain-input');
+  const status = document.getElementById('rule-status');
+  if (!input) return;
+  const domain = input.value.trim();
+  if (!domain) return;
+  fetch('/api/rules', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ domain, mode }})
+  }})
+    .then((r) => r.json())
+    .then((res) => {{
+      if (status) status.textContent = res.message || '';
+      if (res.ok) {{
+        input.value = '';
+        loadUserRules();
+      }}
+    }})
+    .catch(() => {{}});
+}}
+
+document.addEventListener('DOMContentLoaded', () => {{
+  const ua = navigator.userAgent || '';
+  if (/iPhone|iPad|iPod/i.test(ua)) {{
+    switchSupercellTab('ios');
+  }} else {{
+    switchSupercellTab('android');
+  }}
+  loadUserRules();
+  setInterval(refreshSystemStatus, 3000);
+}});
+</script>
+</head>
+<body>
+<div class="container">
+  <div class="card">
+    <div class="header">
+      <h1>Zapret TV & Mobile Bridge</h1>
+      <span id="overall-badge" class="{overall_badge_cls}">{overall_badge_text}</span>
+    </div>
+    {update_banner}
+    <p class="desc">
+      Локальный сетевой шлюз и прокси-мост с поддержкой <strong>Умной маршрутизации трафика</strong> (Smart Routing). Оптимизирует потоковое видео и медиа-сервисы через Zapret на ПК.
+    </p>
+
+    <!-- Live 3-Contour System Status -->
+    <div class="contours-box">
+      <div class="contour-row">
+        <span class="contour-name">🛡️ Служба Zapret (DPI)</span>
+        <span id="cnt-zapret" class="{zapret_cls}">{zapret_label}</span>
+      </div>
+      <div class="contour-row">
+        <span class="contour-name">🌐 HTTP / SOCKS5 шлюз</span>
+        <span id="cnt-gateway" class="contour-pill on">{gw_label}</span>
+      </div>
+      <div class="contour-row">
+        <span class="contour-name">✈️ Telegram MTProto</span>
+        <span id="cnt-tg" class="{tg_cls}">{tg_label}</span>
+      </div>
+    </div>
+
+    <!-- Section 1: PAC Autoconfig for iOS / macOS / Windows -->
+    <div class="section">
+      <div class="section-title">1. Автоконфигурация PAC (iOS / iPad / Mac / Windows)</div>
+      <p class="info-text">В настройках сети Wi-Fi выберите <strong>Настройка прокси -&gt; Автоматически</strong> и укажите URL (российские сервисы и Apple идут напрямую, зарубежные — через умный шлюз):</p>
+      <div class="val-row">
+        <code>http://{ip}:{proxy_port}/proxy.pac</code>
+        <button class="copy-btn" onclick="copyText('http://{ip}:{proxy_port}/proxy.pac', this)">Копировать</button>
+      </div>
+      <div class="btn-group" style="margin-top: 10px;">
+        <a class="btn" style="background: #1e293b; border: 1px solid var(--border); color: #fff;" href="/yandexdns.mobileconfig" onclick="return handleProfileClick(event, '/yandexdns.mobileconfig', 'YandexDNS')">🛡️ Профиль шифрованного DNS (Яндекс DoT для iOS)</a>
+      </div>
+      <p class="info-text" style="font-size: 12px; margin-top: 6px;">
+        Опционально для Safari на iPhone: защищает от подмены DNS на прямых подключениях (включая мобильный интернет), если в роутере стоит стандартный DNS провайдера.
+      </p>
+    </div>
+
+    <!-- Section 2: Manual HTTP Proxy for Smart TVs -->
+    <div class="section">
+      <div class="section-title">2. Smart TV (LG webOS / Android TV / Apple TV)</div>
+      <p class="info-text">В расширенных настройках сети телевизора выберите <strong>Прокси (HTTP)</strong>:</p>
+      <div class="val-row">
+        <span>IP сервера: <code>{ip}</code></span>
+        <button class="copy-btn" onclick="copyText('{ip}', this)">Копировать IP</button>
+      </div>
+      <div class="val-row" style="margin-top: 6px;">
+        <span>Порт: <code>{proxy_port}</code></span>
+        <button class="copy-btn" onclick="copyText('{proxy_port}', this)">Копировать порт</button>
+      </div>
+    </div>
+
+    <!-- Section 3: Telegram MTProto WebSocket -->
+    <div class="section">
+      <div class="section-title">3. Telegram MTProto Proxy (1 клик)</div>
+      <p class="info-text">Стабильное прямое подключение Telegram без задержек (поддерживает любые аккаунты):</p>
+      <div class="btn-group">
+        <a class="btn btn-tg" href="tg://proxy?server={ip}&port={tg_port}&secret={tg_secret}" onclick="handleTgClick(event, 'tg://proxy?server={ip}&port={tg_port}&secret={tg_secret}', '{ip}', '{tg_port}', '{tg_secret}')">⚡ Подключить в Telegram</a>
+        <button class="btn" style="background: #1e293b; border: 1px solid var(--border); color: #fff;" onclick="copyText('tg://proxy?server={ip}&port={tg_port}&secret={tg_secret}', this)">📋 Скопировать ссылку tg://</button>
+      </div>
+      <div id="tg-toast" style="display:none; margin-top: 8px; font-size: 13px; color: var(--accent); background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.25); padding: 8px 12px; border-radius: 6px;">
+        ✓ Ссылка скопирована! Если Telegram не открылся автоматически, вставьте её в диалог «Избранное» (Saved Messages) в Telegram и нажмите на неё.
+      </div>
+      <div class="val-row" style="margin-top: 10px;">
+        <span>Сервер: <code>{ip}</code> &bull; Порт: <code>{tg_port}</code></span>
+        <button class="copy-btn" onclick="copyText('{ip}:{tg_port}', this)">Копировать</button>
+      </div>
+      <div class="val-row" style="margin-top: 6px;">
+        <span>Секрет: <code>{tg_secret}</code></span>
+        <button class="copy-btn" onclick="copyText('{tg_secret}', this)">Копировать</button>
+      </div>
+    </div>
+
+    <!-- Section 4: Supercell Gaming (Clash Royale & Brawl Stars) -->
+    <div class="section">
+      <div class="section-title">4. Clash Royale & Brawl Stars (Supercell)</div>
+
+      <div class="tab-nav">
+        <button id="sc-tab-android" class="tab-btn active" onclick="switchSupercellTab('android')">🤖 Android (Частный DNS)</button>
+        <button id="sc-tab-ios" class="tab-btn" onclick="switchSupercellTab('ios')">🍏 iOS / iPhone (Профиль)</button>
+      </div>
+
+      <!-- Android Pane -->
+      <div id="sc-pane-android" class="tab-pane active">
+        <p class="info-text">
+          На Android подключение к серверам Supercell (Clash Royale, Brawl Stars) работает через системный <strong>Частный DNS (DNS-over-TLS)</strong> без сторонних приложений и без VPN:
+        </p>
+
+        <div style="margin-top: 10px;">
+          <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Основной игровой хост (Null's Proxy DoT):</div>
+          <div class="val-row">
+            <code>dns.nullsproxy.com</code>
+            <button class="copy-btn" onclick="copyText('dns.nullsproxy.com', this)">Скопировать</button>
+          </div>
+        </div>
+
+        <div style="margin-top: 8px;">
+          <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 4px;">Резервный игровой хост (COMSS DoT):</div>
+          <div class="val-row">
+            <code>dns.comss.one</code>
+            <button class="copy-btn" onclick="copyText('dns.comss.one', this)">Скопировать</button>
+          </div>
+        </div>
+
+        <div style="margin-top: 12px;">
+          <a class="btn" href="intent:#Intent;action=android.settings.NETWORK_OPERATOR_SETTINGS;end" style="width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px;">⚙️ Открыть настройки сети на телефоне</a>
+        </div>
+
+        <div style="background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-top: 12px; font-size: 12px; line-height: 1.6;">
+          <div style="font-weight: 700; color: var(--accent); margin-bottom: 6px;">📋 Инструкция по настройке на Android:</div>
+          <ol style="margin-left: 18px; color: #cbd5e1;">
+            <li>Скопируйте хост <code>dns.nullsproxy.com</code> кнопкой выше.</li>
+            <li>Откройте <strong>Настройки</strong> телефона → <strong>Подключения</strong> (или <strong>Сеть и интернет</strong>).</li>
+            <li>Найдите пункт <strong>Персональный DNS</strong> (или <strong>Частный DNS</strong>).</li>
+            <li>Переключите режим на <strong>«Имя хоста провайдера персонального DNS»</strong>.</li>
+            <li>Вставьте скопированный адрес <code>dns.nullsproxy.com</code> и нажмите <strong>Сохранить</strong>.</li>
+            <li>Перезапустите Clash Royale или Brawl Stars!</li>
+          </ol>
+          <div style="margin-top: 8px; font-size: 11px; color: var(--text-muted);">
+            • <em>Samsung (One UI):</em> Настройки → Подключения → Другие настройки → Персональный DNS.<br>
+            • <em>Xiaomi / POCO (HyperOS / MIUI):</em> Настройки → Подключение и общий доступ → Частный DNS-сервер.<br>
+            • <em>Pixel / Чистый Android:</em> Настройки → Сеть и интернет → Частный DNS.<br>
+            • <em>Realme / OPPO / OnePlus:</em> Настройки → Подключение и общий доступ → Частный DNS.
+          </div>
+        </div>
+
+        <div style="background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12px; color: #bae6fd; line-height: 1.5;">
+          💡 <strong>Лайфхак для Clash Royale:</strong> если при первом запуске полоса загрузки останавливается на <strong>«Обновление 50%»</strong> — включите любой VPN на 1 минуту, чтобы игра загрузила ресурсы обновления до 100%, затем выключите VPN. Все последующие входы и бои будут подключаться моментально через Частный DNS без задержек и без VPN.
+        </div>
+      </div>
+
+      <!-- iOS Pane -->
+      <div id="sc-pane-ios" class="tab-pane">
+        <p class="info-text">Для прямого подключения игр Supercell на iOS скачайте игровой DNS-профиль:</p>
+        <div class="btn-group">
+          <a class="btn" href="/supercell.mobileconfig" onclick="return handleProfileClick(event, '/supercell.mobileconfig', 'COMSS')">📥 Профиль COMSS (Рекомендуется: DoH)</a>
+          <a class="btn" href="/nullsproxy.mobileconfig" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.2); color: #fff;" onclick="return handleProfileClick(event, '/nullsproxy.mobileconfig', 'Nulls')">📥 Null's Proxy (DoT)</a>
+        </div>
+        <div style="background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 8px; padding: 10px 12px; margin-top: 12px; font-size: 12px; color: #fbbf24; line-height: 1.5;">
+          ⚠️ <strong>Важно для iPhone:</strong> Apple разрешает загрузку профилей <strong>только через Safari</strong>.<br>
+          Если вы открыли сайт в Edge или Chrome — скопируйте ссылку ниже и откройте её в <strong>Safari</strong>:
+        </div>
+        <div class="val-row" style="margin-top: 6px;">
+          <span>COMSS: <code>/supercell.mobileconfig</code></span>
+          <button class="copy-btn" onclick="copyText('http://{ip}:{proxy_port}/supercell.mobileconfig', this)">Копировать для Safari</button>
+        </div>
+        <div class="val-row" style="margin-top: 6px;">
+          <span>Null's: <code>/nullsproxy.mobileconfig</code></span>
+          <button class="copy-btn" onclick="copyText('http://{ip}:{proxy_port}/nullsproxy.mobileconfig', this)">Копировать для Safari</button>
+        </div>
+        <p class="info-text" style="font-size: 12px; margin-top: 8px;">
+          После открытия ссылки в Safari: <em>Разрешить -&gt; Настройки iPhone -&gt; Профиль загружен -&gt; Установить</em>.
+        </p>
+        <div style="background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 12px; color: #bae6fd; line-height: 1.5;">
+          💡 <strong>Лайфхак для Clash Royale:</strong> если при первом запуске полоса зависает на «Обновление 50%», включите любой VPN на 1 минуту, дайте игре скачать ресурсы обновления до 100%, затем выключите VPN.
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 5: Telemetry Status Grid -->
+    <div class="section">
+      <div class="section-title">5. Состояние и статистика (Uptime: <span id="stat-uptime">{uptime_human}</span>)</div>
+      <div class="stats-grid">
+        <div class="stat-box"><div id="stat-active" class="stat-num">{active_conn}</div><div class="stat-label">Активных соединений</div></div>
+        <div class="stat-box"><div id="stat-total" class="stat-num">{total_conn}</div><div class="stat-label">Всего соединений</div></div>
+        <div class="stat-box"><div id="stat-up" class="stat-num">{up_human}</div><div class="stat-label">Отправлено</div></div>
+        <div class="stat-box"><div id="stat-down" class="stat-num">{down_human}</div><div class="stat-label">Принято</div></div>
+      </div>
+    </div>
+
+    <!-- Section 6: Custom Domain Rules -->
+    <div class="section">
+      <div class="section-title">6. Пользовательские правила доменов</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+        <input id="rule-domain-input" type="text" placeholder="example.com" style="flex:1;min-width:180px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);">
+        <button class="copy-btn" onclick="addUserRule('target')">+ Ускорить</button>
+        <button class="copy-btn" onclick="addUserRule('exclude')">- Напрямую</button>
+      </div>
+      <div id="rule-status" class="info-text" style="margin-top:6px;"></div>
+      <div id="rules-list"></div>
+    </div>
+
+    <footer>
+      Zapret TV & Mobile Bridge &bull; Локальный хост: {ip}:{proxy_port}
+    </footer>
+  </div>
+</div>
+</body>
+</html>"#,
+        ip = ip,
+        proxy_port = proxy_port,
+        tg_port = tg_port,
+        tg_secret = clean_tg_secret,
+        overall_badge_cls = overall_badge_cls,
+        overall_badge_text = overall_badge_text,
+        zapret_cls = zapret_cls,
+        zapret_label = zapret_label,
+        gw_label = gw_label,
+        tg_cls = tg_cls,
+        tg_label = tg_label,
+        uptime_human = uptime_human,
+        active_conn = metrics.active_connections,
+        total_conn = metrics.total_connections,
+        up_human = up_human,
+        down_human = down_human,
+        update_banner = update_banner,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+
+    #[tokio::test]
+    async fn test_create_web_router_health() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default();
+        let router = create_web_router(metrics, config);
+
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json.status, "ok");
+        assert_eq!(json.service, "ZapretTVBridge");
+    }
+
+    #[tokio::test]
+    async fn test_create_web_router_favicon() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default();
+        let router = create_web_router(metrics, config);
+
+        let req = Request::builder()
+            .uri("/favicon.ico")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_create_web_router_pac() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default_with_port(8080);
+        let router = create_web_router(metrics, config);
+
+        let req = Request::builder()
+            .uri("/proxy.pac")
+            .header("host", "192.168.1.150:8080")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-ns-proxy-autoconfig; charset=utf-8"
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let script = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(script.contains("PROXY 192.168.1.150:8080; DIRECT"));
+    }
+
+    #[tokio::test]
+    async fn test_create_web_router_mobileconfig() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default();
+        let router = create_web_router(metrics, config);
+
+        let req = Request::builder()
+            .uri("/supercell.mobileconfig")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-apple-aspen-config; charset=utf-8"
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(text.contains("PayloadType"));
+        assert!(text.contains("dns.comss.one"));
+    }
+
+    #[tokio::test]
+    async fn test_create_web_router_yandex_mobileconfig() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default();
+        let router = create_web_router(metrics, config);
+
+        let req = Request::builder()
+            .uri("/yandexdns.mobileconfig")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/x-apple-aspen-config; charset=utf-8"
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let text = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(text.contains("PayloadType"));
+        assert!(text.contains("common.dot.dns.yandex.net"));
+        assert!(text.contains("<string>TLS</string>"));
+    }
+
+    #[tokio::test]
+    async fn test_create_web_router_dashboard_android_supercell() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default_with_port(8080);
+        let router = create_web_router(metrics, config);
+
+        let req = Request::builder()
+            .uri("/")
+            .header("host", "192.168.1.150:8080")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let html = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(html.contains("Clash Royale & Brawl Stars"));
+        assert!(html.contains("dns.nullsproxy.com"));
+        assert!(html.contains("dns.comss.one"));
+        assert!(html.contains("sc-tab-android"));
+        assert!(html.contains("sc-tab-ios"));
+        assert!(html.contains("Обновление 50%"));
+        assert!(html.contains("cnt-zapret"));
+        assert!(html.contains("cnt-gateway"));
+        assert!(html.contains("cnt-tg"));
+    }
+
+    #[tokio::test]
+    async fn test_create_web_router_system_status_contours() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default_with_port(8080);
+        let router = create_web_router(metrics, config);
+
+        let req = Request::builder()
+            .uri("/api/status")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let parsed: SystemStatusResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(parsed.contours.gateway_active);
+        assert_eq!(parsed.contours.http_port, 8080);
+        assert_eq!(parsed.contours.tg_port, 1443);
+    }
+
+    #[tokio::test]
+    async fn test_web_router_rules_api() {
+        let dir = std::env::temp_dir().join(format!("ztb_web_rules_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lists")).unwrap();
+        let smart_router = Arc::new(crate::router::SmartRouter::new(&dir));
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default_with_port(8080);
+        let app = create_web_router_with_router(metrics, config, Some(Arc::clone(&smart_router)));
+
+        let post_req = Request::builder()
+            .method("POST")
+            .uri("/api/rules")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"domain":"custom-test.org","mode":"target"}"#))
+            .unwrap();
+        let post_resp = app.clone().oneshot(post_req).await.unwrap();
+        assert_eq!(post_resp.status(), StatusCode::OK);
+        assert!(smart_router.should_route("sub.custom-test.org").0);
+
+        let get_req = Request::builder()
+            .uri("/api/rules")
+            .body(Body::empty())
+            .unwrap();
+        let get_resp = app.oneshot(get_req).await.unwrap();
+        assert_eq!(get_resp.status(), StatusCode::OK);
+        let body = to_bytes(get_resp.into_body(), 1024 * 1024).await.unwrap();
+        let list: RulesListResponse = serde_json::from_slice(&body).unwrap();
+        assert!(list.target.iter().any(|d| d == "custom-test.org"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_web_router_404() {
+        let metrics = Arc::new(ProxyMetrics::new());
+        let config = WebConfig::default();
+        let router = create_web_router(metrics, config);
+
+        let req = Request::builder()
+            .uri("/unknown-route")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}

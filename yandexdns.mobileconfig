@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>DNSSettings</key>
+            <dict>
+                <key>DNSProtocol</key>
+                <string>TLS</string>
+                <key>ServerName</key>
+                <string>common.dot.dns.yandex.net</string>
+            </dict>
+            <key>OnDemandRules</key>
+            <array>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>WiFi</string>
+                </dict>
+                <dict>
+                    <key>Action</key>
+                    <string>Connect</string>
+                    <key>InterfaceTypeMatch</key>
+                    <string>Cellular</string>
+                </dict>
+                <dict>
+                    <key>Action</key>
+                    <string>Disconnect</string>
+                </dict>
+            </array>
+            <key>PayloadDescription</key>
+            <string>Шифрованный DNS over TLS (Яндекс DNS) для защиты от подмены ответов провайдером</string>
+            <key>PayloadDisplayName</key>
+            <string>Yandex Safe DNS (DoT)</string>
+            <key>PayloadIdentifier</key>
+            <string>com.apple.dnsSettings.managed.yandex.dot</string>
+            <key>PayloadType</key>
+            <string>com.apple.dnsSettings.managed</string>
+            <key>PayloadUUID</key>
+            <string>A8E4B210-4D3C-489B-9E12-7F3A11C9D001</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+            <key>ProhibitDisablement</key>
+            <false/>
+        </dict>
+    </array>
+    <key>PayloadDescription</key>
+    <string>Профиль шифрованного DNS (DNS-over-TLS) от Яндекса для iPhone и iPad</string>
+    <key>PayloadDisplayName</key>
+    <string>Yandex Safe DNS (DoT)</string>
+    <key>PayloadIdentifier</key>
+    <string>com.zapretbridge.yandex.dns.profile</string>
+    <key>PayloadOrganization</key>
+    <string>Zapret TV Bridge</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>E3C71920-6B5A-4A4E-8F21-9A0C44E8B002</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>

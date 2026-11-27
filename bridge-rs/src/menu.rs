@@ -1,0 +1,2215 @@
+use crate::{pac, win32};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// Windows Creation Flags
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x00000008;
+
+/// Checks if current process is running with Administrator privileges.
+pub fn is_admin() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn IsUserAnAdmin() -> i32;
+        }
+        unsafe { IsUserAnAdmin() != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// Reruns current executable with Administrator privileges via UAC if not already elevated.
+pub fn ensure_admin(args: &[String]) {
+    #[cfg(windows)]
+    {
+        if is_admin() {
+            return;
+        }
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: isize,
+                lpOperation: *const u16,
+                lpFile: *const u16,
+                lpParameters: *const u16,
+                lpDirectory: *const u16,
+                nShowCmd: i32,
+            ) -> isize;
+        }
+
+        if let Ok(exe) = std::env::current_exe() {
+            let exe_wide: Vec<u16> = exe
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let op_wide: Vec<u16> = OsStr::new("runas")
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let params = args
+                .iter()
+                .map(|a| format!("\"{}\"", a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let params_wide: Vec<u16> = OsStr::new(&params)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let ret = unsafe {
+                ShellExecuteW(
+                    0,
+                    op_wide.as_ptr(),
+                    exe_wide.as_ptr(),
+                    params_wide.as_ptr(),
+                    std::ptr::null(),
+                    1,
+                )
+            };
+            if ret > 32 {
+                std::process::exit(0);
+            }
+        }
+    }
+}
+
+/// Pauses and waits for user to press Enter.
+pub fn pause_menu() {
+    println!("\n   Нажмите Enter для возврата в меню...");
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+}
+
+/// Pauses before program exit.
+pub fn pause_exit() {
+    println!("\n   Нажмите Enter для закрытия окна...");
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+}
+
+/// Checks whether a process PID is currently running.
+pub fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> isize;
+            fn CloseHandle(hObject: isize) -> i32;
+            fn GetExitCodeProcess(hProcess: isize, lpExitCode: *mut u32) -> i32;
+        }
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const STILL_ACTIVE: u32 = 259;
+
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle != 0 {
+            let mut code: u32 = 0;
+            let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+            unsafe { CloseHandle(handle) };
+            return ok != 0 && code == STILL_ACTIVE;
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(format!("/proc/{}", pid)).exists()
+    }
+}
+
+/// Checks whether bridge daemon is running (via PID file or port 8080 probe).
+pub fn is_bridge_running(base_dir: &Path) -> (bool, Option<u32>) {
+    let pid_file = base_dir.join("tv_proxy.pid");
+    if pid_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                if is_pid_alive(pid) {
+                    return (true, Some(pid));
+                }
+            }
+        }
+    }
+
+    // Secondary check: probe port 8080
+    if let Ok(_stream) = std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:8080".parse().unwrap(),
+        std::time::Duration::from_millis(300),
+    ) {
+        return (true, None);
+    }
+
+    (false, None)
+}
+
+/// Checks whether Telegram Proxy (builtin or tgwsproxy) is active on the configured port.
+pub fn is_tg_proxy_running_on_port(base_dir: &Path, tg_port: u16) -> (bool, Option<u32>) {
+    let pid_file = base_dir.join("tg_proxy.pid");
+    if pid_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                if is_pid_alive(pid) {
+                    return (true, Some(pid));
+                }
+            }
+        }
+    }
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], tg_port));
+    if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(120)).is_ok() {
+        return (true, None);
+    }
+
+    (false, None)
+}
+
+/// Checks whether Telegram Proxy (tgwsproxy) is running (via PID file or port 1443 probe).
+pub fn is_tg_proxy_running(base_dir: &Path) -> (bool, Option<u32>) {
+    is_tg_proxy_running_on_port(base_dir, 1443)
+}
+
+/// Formats a raw Telegram secret (`32 hex`, `dd...`, or `ee...` FakeTLS masking secret) for `tg://proxy` links.
+pub fn format_telegram_secret(raw: &str) -> String {
+    let s = raw.trim();
+    let prefix = s.get(..2).unwrap_or("").to_ascii_lowercase();
+    if prefix == "dd" || prefix == "ee" {
+        s.to_string()
+    } else if s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("dd{s}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Fast zero-process Win32 query of the `zapret` service state and active strategy via SCM and Registry.
+#[cfg(windows)]
+pub fn query_zapret_service_fast() -> Option<(bool, String)> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ServiceStatus {
+        dw_service_type: u32,
+        dw_current_state: u32,
+        dw_controls_accepted: u32,
+        dw_win32_exit_code: u32,
+        dw_service_specific_exit_code: u32,
+        dw_check_point: u32,
+        dw_wait_hint: u32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            hKey: isize,
+            lpSubKey: *const u16,
+            ulOptions: u32,
+            samDesired: u32,
+            phkResult: *mut isize,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hKey: isize,
+            lpValueName: *const u16,
+            lpReserved: *const u32,
+            lpType: *mut u32,
+            lpData: *mut u8,
+            lpcbData: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(hKey: isize) -> i32;
+        fn OpenSCManagerW(
+            lpMachineName: *const u16,
+            lpDatabaseName: *const u16,
+            dwDesiredAccess: u32,
+        ) -> isize;
+        fn OpenServiceW(
+            hSCManager: isize,
+            lpServiceName: *const u16,
+            dwDesiredAccess: u32,
+        ) -> isize;
+        fn QueryServiceStatus(hService: isize, lpServiceStatus: *mut ServiceStatus) -> i32;
+        fn CloseServiceHandle(hSCObject: isize) -> i32;
+    }
+
+    const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const SC_MANAGER_CONNECT: u32 = 0x0001;
+    const SERVICE_QUERY_STATUS: u32 = 0x0004;
+    const SERVICE_RUNNING: u32 = 4;
+
+    let mut strategy = String::new();
+    let subkey: Vec<u16> = OsStr::new(r"System\CurrentControlSet\Services\zapret")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let val_name: Vec<u16> = OsStr::new("zapret-discord-youtube")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut hkey: isize = 0;
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey) }
+        == 0
+        && hkey != 0
+    {
+        let mut buf = [0u16; 256];
+        let mut cb_data: u32 = (buf.len() * 2) as u32;
+        let mut reg_type: u32 = 0;
+        let rc = unsafe {
+            RegQueryValueExW(
+                hkey,
+                val_name.as_ptr(),
+                std::ptr::null(),
+                &mut reg_type,
+                buf.as_mut_ptr() as *mut u8,
+                &mut cb_data,
+            )
+        };
+        if rc == 0 && cb_data >= 2 {
+            let u16_len = (cb_data as usize) / 2;
+            let slice = &buf[..u16_len];
+            let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+            strategy = String::from_utf16_lossy(&slice[..end]).trim().to_string();
+        }
+        unsafe { RegCloseKey(hkey) };
+    }
+
+    let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if scm == 0 {
+        return None;
+    }
+
+    let svc_name: Vec<u16> = OsStr::new("zapret")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let svc = unsafe { OpenServiceW(scm, svc_name.as_ptr(), SERVICE_QUERY_STATUS) };
+    if svc == 0 {
+        unsafe { CloseServiceHandle(scm) };
+        return Some((false, strategy));
+    }
+
+    let mut status = ServiceStatus::default();
+    let ok = unsafe { QueryServiceStatus(svc, &mut status) };
+    unsafe {
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+    }
+
+    if ok != 0 {
+        Some((status.dw_current_state == SERVICE_RUNNING, strategy))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub fn query_zapret_service_fast() -> Option<(bool, String)> {
+    None
+}
+
+/// Checks Zapret Windows service status and active strategy preset.
+pub fn get_zapret_service_status() -> (bool, String) {
+    if let Some((running, strategy)) = query_zapret_service_fast() {
+        if running {
+            return (true, strategy);
+        }
+        // Service not running in SCM: quick zero-spawn Win32 check for standalone winws.exe
+        if win32::is_process_running("winws.exe") {
+            return (true, strategy);
+        }
+        return (false, strategy);
+    }
+
+    let mut is_running = false;
+    let mut strategy = String::new();
+
+    // Query registry for active strategy
+    let reg_output = Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\System\CurrentControlSet\Services\zapret",
+            "/v",
+            "zapret-discord-youtube",
+        ])
+        .output();
+
+    if let Ok(out) = reg_output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if line.contains("zapret-discord-youtube") && line.contains("REG_SZ") {
+                let parts: Vec<&str> = line.split("REG_SZ").collect();
+                if parts.len() >= 2 {
+                    strategy = parts[1].trim().to_string();
+                }
+            }
+        }
+    }
+
+    // Query sc.exe for service status
+    let sc_output = Command::new("sc").args(["query", "zapret"]).output();
+    if let Ok(out) = sc_output {
+        let text = String::from_utf8_lossy(&out.stdout).to_uppercase();
+        if text.contains("RUNNING") || text.contains(": 4") {
+            is_running = true;
+        }
+    }
+
+    // Fallback: check winws.exe process natively
+    if !is_running && win32::is_process_running("winws.exe") {
+        is_running = true;
+    }
+
+    (is_running, strategy)
+}
+
+/// Checks whether autostart is configured via Registry Run, Startup shortcut, or Scheduled Task.
+pub fn is_startup_enabled() -> bool {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let startup_dir =
+        PathBuf::from(&appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup");
+    if startup_dir.join("Zapret_TV_Bridge.lnk").exists()
+        || startup_dir.join("Zapret_TV_Bridge.vbs").exists()
+    {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        if win32::reg_value_exists(
+            win32::HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            "ZapretTVBridge",
+        ) || win32::reg_value_exists(
+            win32::HKEY_LOCAL_MACHINE,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            "ZapretTVBridge",
+        ) {
+            return true;
+        }
+    }
+
+    let sch_output = Command::new("schtasks")
+        .args(&["/query", "/tn", "Zapret_TV_Bridge"])
+        .output();
+
+    if let Ok(out) = sch_output {
+        if out.status.success() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Stops the `zapret` Windows service via SCM before any fallback `taskkill`
+/// and unloads `WinDivert` so `WinDivert64.sys` from previous folders is never held locked.
+pub fn stop_zapret_service_gracefully() {
+    let _ = win32::service_stop("zapret");
+    let mut stopped = false;
+    for _ in 0..12 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let (running, _) = get_zapret_service_status();
+        if !running {
+            stopped = true;
+            break;
+        }
+    }
+    if !stopped {
+        win32::kill_by_name("winws.exe", None);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    for drv in ["WinDivert", "WinDivert14"] {
+        let _ = win32::service_stop(drv);
+        let _ = win32::service_delete(drv);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+}
+
+/// Removes all legacy and current autostart / Task Scheduler entries for Zapret Bridge.
+pub fn cleanup_legacy_startup_entries(base_dir: &Path) {
+    let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let vbs_path = PathBuf::from(&local_appdata)
+        .join("ZapretTVBridge")
+        .join("bridge_autostart.vbs");
+    let repo_vbs = base_dir.join("bridge_autostart.vbs");
+
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let startup_dir =
+        PathBuf::from(&appdata).join(r"Microsoft\Windows\Start Menu\Programs\Startup");
+    let shortcut_path = startup_dir.join("Zapret_TV_Bridge.lnk");
+    let startup_vbs = startup_dir.join("Zapret_TV_Bridge.vbs");
+
+    #[cfg(windows)]
+    {
+        win32::reg_delete_value(
+            win32::HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            "ZapretTVBridge",
+        );
+        win32::reg_delete_value(
+            win32::HKEY_LOCAL_MACHINE,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            "ZapretTVBridge",
+        );
+    }
+
+    for task_name in ["Zapret_TV_Bridge", "ZapretTVBridge"] {
+        let _ = Command::new("schtasks")
+            .args(["/delete", "/tn", task_name, "/f"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+
+    // Native CSV scan for any other legacy Zapret Bridge scheduled tasks (avoids PowerShell startup cost)
+    #[cfg(windows)]
+    if let Ok(out) = Command::new("schtasks")
+        .args(["/query", "/fo", "CSV", "/nh"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            if let Some(first_col) = line.split("\",\"").next() {
+                let tn = first_col.trim_matches('"').trim();
+                let low = tn.to_ascii_lowercase();
+                if (low.contains("zapret") && low.contains("bridge")) || low.contains("zaprettvbridge")
+                {
+                    let _ = Command::new("schtasks")
+                        .args(["/delete", "/tn", tn, "/f"])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output();
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&shortcut_path);
+    let _ = std::fs::remove_file(&startup_vbs);
+    let _ = std::fs::remove_file(&vbs_path);
+    let _ = std::fs::remove_file(&repo_vbs);
+}
+
+/// Checks GitHub Releases for a newer version (`brief` prints only if an update exists).
+pub fn cmd_check_update(brief: bool) {
+    if !brief {
+        println!("\n[*] Проверка обновлений на GitHub...");
+    }
+    match crate::updater::check_for_updates_cached(!brief) {
+        crate::updater::UpdateCheckResult::UpdateAvailable { current, release } => {
+            if brief {
+                println!(
+                    "  [!] Доступно обновление: {} (установлена v{}) -- выберите пункт 9!",
+                    release.tag_name, current
+                );
+            } else {
+                println!(
+                    "  [+] Найдена новая версия: {} (текущая: v{})",
+                    release.tag_name, current
+                );
+                println!("      Архив: {}", release.asset_name);
+                println!("      Ссылка: {}", release.html_url);
+            }
+        }
+        crate::updater::UpdateCheckResult::UpToDate { current, latest } => {
+            if !brief {
+                println!(
+                    "  [OK] У вас установлена актуальная версия (v{} / {}).",
+                    current, latest
+                );
+            }
+        }
+        crate::updater::UpdateCheckResult::Error(err) => {
+            if !brief {
+                println!("  [!] Не удалось проверить обновления: {}", err);
+            }
+        }
+    }
+}
+
+/// Downloads and applies a newer release from GitHub, replacing old scheduled tasks cleanly.
+pub fn cmd_self_update(base_dir: &Path) -> bool {
+    ensure_admin(&["--update".to_string()]);
+    if !is_admin() {
+        println!("\n[!] Ошибка: Для самообновления служб требуются права Администратора.");
+        return false;
+    }
+
+    println!("\n  ==================================================");
+    println!("  ПРОВЕРКА И УСТАНОВКА ОБНОВЛЕНИЯ");
+    println!("  ==================================================");
+    println!("[*] Запрос актуального релиза на GitHub...");
+
+    match crate::updater::check_for_updates_cached(true) {
+        crate::updater::UpdateCheckResult::UpdateAvailable { current, release } => {
+            println!(
+                "[+] Доступна новая версия: {} (текущая: v{})",
+                release.tag_name, current
+            );
+            match crate::updater::perform_self_update(base_dir, &release) {
+                Ok(()) => {
+                    println!(
+                        "[+] Обновлятор запущен. Программа перезапустится автоматически."
+                    );
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("[!] Ошибка при обновлении: {}", e);
+                    false
+                }
+            }
+        }
+        crate::updater::UpdateCheckResult::UpToDate { current, latest } => {
+            println!(
+                "[OK] Установлена актуальная версия: v{} (релиз {}).",
+                current, latest
+            );
+            true
+        }
+        crate::updater::UpdateCheckResult::Error(e) => {
+            println!("[!] Не удалось проверить обновления: {}", e);
+            false
+        }
+    }
+}
+
+/// Discovers available strategy presets in presets folder.
+pub fn discover_zapret_strategies(base_dir: &Path) -> Vec<(String, PathBuf)> {
+    let presets_dir = base_dir.join("presets");
+    let mut strategies = Vec::new();
+
+    if presets_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&presets_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("bat") {
+                    let name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !name.to_lowercase().starts_with("service") {
+                        strategies.push((name, path));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort with "general (ALT)" prioritized, then ALT numbers, then "general", then others
+    strategies.sort_by(|(a_name, _), (b_name, _)| {
+        let a_low = a_name.to_lowercase();
+        let b_low = b_name.to_lowercase();
+
+        let rank = |s: &str| -> (u8, u32) {
+            if s == "general (alt)" {
+                (1, 1)
+            } else if s.starts_with("general (alt") && s.ends_with(')') {
+                let num_str = &s[12..s.len() - 1];
+                let num = num_str.parse::<u32>().unwrap_or(99);
+                (1, num)
+            } else if s == "general" {
+                (2, 0)
+            } else if s.contains("exp") {
+                (3, 0)
+            } else if s.contains("fake tls") {
+                (4, 0)
+            } else {
+                (5, 0)
+            }
+        };
+
+        rank(&a_low)
+            .cmp(&rank(&b_low))
+            .then_with(|| a_low.cmp(&b_low))
+    });
+
+    strategies
+}
+
+/// Parses winws.exe arguments from a strategy .bat file.
+pub fn parse_strategy_args(bat_path: &Path, bin_dir: &Path, lists_dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(bat_path).ok()?;
+
+    let bin_str = format!("{}\\", bin_dir.to_string_lossy().trim_end_matches('\\'));
+    let lists_str = format!("{}\\", lists_dir.to_string_lossy().trim_end_matches('\\'));
+
+    let (game_tcp, game_udp) = game_filter_ports(lists_dir);
+    let mut replaced = content
+        .replace("%GameFilterTCP%", &game_tcp)
+        .replace("%GameFilterUDP%", &game_udp)
+        .replace("%GameFilter%", &game_tcp)
+        .replace("%BIN%", &bin_str)
+        .replace("%LISTS%", &lists_str);
+
+    // Normalize Windows CRLF
+    replaced = replaced.replace("\r\n", "\n");
+
+    let mut capture = false;
+    let mut winws_lines = Vec::new();
+
+    for line in replaced.lines() {
+        let stripped = line.trim();
+        if stripped.contains("winws.exe") {
+            capture = true;
+        }
+        if capture {
+            winws_lines.push(stripped);
+            if !stripped.ends_with('^') {
+                break;
+            }
+        }
+    }
+
+    if winws_lines.is_empty() {
+        return None;
+    }
+
+    let full_cmd = winws_lines.join(" ").replace('^', " ");
+    if let Some(pos) = find_ignore_ascii_case(&full_cmd, "winws.exe") {
+        let after = full_cmd[pos + "winws.exe".len()..].trim();
+        let cleaned_after = after.trim_start_matches(|c| c == '"' || c == '\'').trim();
+        let collapsed = collapse_ws_preserve_quotes(cleaned_after);
+        if !collapsed.is_empty() {
+            return Some(collapsed);
+        }
+    }
+
+    None
+}
+
+/// Wide game ports, unless `lists/game_filter.disabled` is present.
+/// Port 12 is only the upstream placeholder that keeps a disabled filter syntactically valid.
+fn game_filter_ports(lists_dir: &Path) -> (String, String) {
+    if lists_dir.join("game_filter.disabled").exists() {
+        ("12".to_string(), "12".to_string())
+    } else {
+        ("1024-65535".to_string(), "1024-65535".to_string())
+    }
+}
+
+fn find_ignore_ascii_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn collapse_ws_preserve_quotes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_quote: Option<char> = None;
+    let mut pending_space = false;
+    for ch in input.chars() {
+        if let Some(q) = in_quote {
+            out.push(ch);
+            if ch == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            in_quote = Some(ch);
+            out.push(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Main Interactive Console Manager for Zapret & TV Bridge.
+pub fn run_interactive_menu(base_dir: &PathBuf) {
+    // Automatically ensure Zapret service is running if registered
+    ensure_zapret_service_running();
+    crate::updater::trigger_background_update_check();
+
+    loop {
+        // Clear console screen on Windows
+        let _ = Command::new("cmd").args(&["/c", "cls"]).status();
+
+        let (zapret_running, zapret_strat) = get_zapret_service_status();
+        let zapret_label = if zapret_running {
+            if !zapret_strat.is_empty() {
+                format!("[RUNNING - {}]", zapret_strat)
+            } else {
+                "[RUNNING]".to_string()
+            }
+        } else {
+            "[STOPPED]".to_string()
+        };
+
+        let (bridge_running, bridge_pid) = is_bridge_running(base_dir);
+        let bridge_label = if bridge_running {
+            if let Some(pid) = bridge_pid {
+                format!("[RUNNING - PID: {}]", pid)
+            } else {
+                "[RUNNING - Active on :8080]".to_string()
+            }
+        } else {
+            "[STOPPED]".to_string()
+        };
+
+        let local_ip = pac::get_local_ip();
+        let host_port = format!("{}:8080", local_ip);
+
+        let secret_file = base_dir.join("tg_secret.txt");
+        let tg_secret = std::fs::read_to_string(&secret_file)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        let startup_enabled = is_startup_enabled();
+        let startup_status = if startup_enabled {
+            "[enabled]"
+        } else {
+            "[disabled]"
+        };
+
+        println!();
+        println!("  ==================================================");
+        println!("  ZAPRET TV & MOBILE BRIDGE MANAGER v1.24 (Rust Core)");
+        println!("  ==================================================");
+        if let Some(rel) = crate::updater::peek_cached_update() {
+            println!(
+                "  [!] ДОСТУПНО ОБНОВЛЕНИЕ: {} (нажмите 9 для установки)",
+                rel.tag_name
+            );
+            println!("  --------------------------------------------------");
+        }
+        println!("  Служба Zapret:         {}", zapret_label);
+        println!("  Шлюз для ТВ/Мобильных: {}", bridge_label);
+        if bridge_running {
+            println!("  Адрес шлюза:           http://{}/", host_port);
+            println!("  PAC URL:               http://{}/proxy.pac", host_port);
+            println!("  Smart TV:              IP {}  Port 8080", local_ip);
+            if !tg_secret.is_empty() {
+                let link_secret = format_telegram_secret(&tg_secret);
+                let (tg_running, tg_pid) = is_tg_proxy_running(base_dir);
+                let tg_tag = if tg_running {
+                    if let Some(p) = tg_pid {
+                        format!(" [PID: {}]", p)
+                    } else {
+                        "".to_string()
+                    }
+                } else {
+                    " [STOPPED]".to_string()
+                };
+                println!(
+                    "  Telegram (tgwsproxy):  tg://proxy?server={}&port=1443&secret={}{}",
+                    local_ip, link_secret, tg_tag
+                );
+            }
+        }
+        println!("  Папка программы:       {}", base_dir.display());
+        println!("  --------------------------------------------------");
+        println!();
+        println!("  :: УПРАВЛЕНИЕ СЛУЖБАМИ");
+        println!("     1. Установить и запустить службы [Выбор стратегии Zapret]");
+        println!("     2. Остановить и удалить службы");
+        println!("     3. Проверить статус и адреса для подключения (ТВ / Смартфон)");
+        println!();
+        println!("  :: НАСТРОЙКИ");
+        println!(
+            "     4. Автозагрузка Windows              {}",
+            startup_status
+        );
+        println!("     5. Открыть веб-панель в браузере");
+        println!("     6. Оптимизировать скорость браузеров (Parallel Downloading & DoH)");
+        println!("     7. Перезапустить шлюз (Restart Bridge)");
+        println!("     8. Синхронизировать базу правил (660,000+ доменов)");
+        println!("     9. Проверить обновления и обновить программу (Auto-Update)");
+        println!();
+        println!("  --------------------------------------------------");
+        println!("     0. Выход");
+        println!("  --------------------------------------------------");
+        println!();
+        print!("   Выберите пункт [0-9]: ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        let mut input = String::new();
+        match std::io::stdin().read_line(&mut input) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+
+        let choice = input.trim();
+        match choice {
+            "0" => break,
+            "1" => {
+                cmd_install_all(base_dir, None);
+                pause_menu();
+            }
+            "2" => {
+                cmd_remove_all(base_dir);
+                pause_menu();
+            }
+            "3" => {
+                cmd_status(base_dir);
+                pause_menu();
+            }
+            "4" => {
+                cmd_toggle_startup(base_dir);
+                pause_menu();
+            }
+            "5" => {
+                cmd_open_browser(&format!("http://{}/", host_port));
+            }
+            "6" => {
+                cmd_optimize_browsers();
+                pause_menu();
+            }
+            "7" => {
+                cmd_restart(base_dir);
+                pause_menu();
+            }
+            "8" => {
+                cmd_sync_rules(base_dir);
+                pause_menu();
+            }
+            "9" => {
+                cmd_self_update(base_dir);
+                pause_menu();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Installs Zapret service with selected strategy preset, starts Bridge daemon, and applies firewall rules.
+pub fn cmd_install_all(base_dir: &Path, chosen_strategy: Option<&str>) -> bool {
+    ensure_admin(&["--menu".to_string()]);
+    if !is_admin() {
+        println!("\n[!] Ошибка: Для установки служб требуются права Администратора.");
+        return false;
+    }
+
+    let startup_was_enabled = is_startup_enabled();
+    let success = cmd_install_strategy(base_dir, chosen_strategy);
+    if !success {
+        return false;
+    }
+
+    println!("\n[*] Перезапуск локального шлюза для Smart TV и мобильных устройств...");
+    cmd_stop(base_dir);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    cmd_start(base_dir);
+    cmd_firewall();
+    cmd_optimize_browsers();
+    if startup_was_enabled {
+        println!("[*] Обновление задачи автозагрузки на текущую папку программы...");
+        cmd_startup(true, base_dir);
+    }
+
+    println!("\n  ==================================================");
+    println!("  [+] ВСЕ СЛУЖБЫ УСПЕШНО УСТАНОВЛЕНЫ И ЗАПУЩЕНЫ!");
+    println!("  ==================================================");
+    println!("  1. Служба Zapret активна с выбранной стратегией.");
+    println!("  2. Сеть Windows в заводском режиме (прямое подключение).");
+    println!("  3. Высокоскоростной шлюз Rust для ТВ и смартфонов запущен.");
+    println!("  4. Системный прокси отключен для изоляции сред разработки.");
+    println!("  5. Многопоточная параллельная загрузка в браузерах настроена.");
+    println!("  --------------------------------------------------\n");
+
+    cmd_status(base_dir);
+    true
+}
+
+/// Directly writes service configuration to registry without sc.exe command line truncation or quoting issues.
+#[cfg(windows)]
+pub fn write_service_registry(full_bin_path: &str, strategy_name: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegCreateKeyExW(
+            hKey: isize,
+            lpSubKey: *const u16,
+            Reserved: u32,
+            lpClass: *const u16,
+            dwOptions: u32,
+            samDesired: u32,
+            lpSecurityAttributes: *const std::ffi::c_void,
+            phkResult: *mut isize,
+            lpdwDisposition: *mut u32,
+        ) -> i32;
+        fn RegSetValueExW(
+            hKey: isize,
+            lpValueName: *const u16,
+            Reserved: u32,
+            dwType: u32,
+            lpData: *const u8,
+            cbData: u32,
+        ) -> i32;
+        fn RegCloseKey(hKey: isize) -> i32;
+    }
+
+    const HKEY_LOCAL_MACHINE: isize = 0x80000002u32 as i32 as isize;
+    const KEY_SET_VALUE: u32 = 0x0002;
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const REG_DWORD: u32 = 4;
+
+    let subkey: Vec<u16> = OsStr::new(r"System\CurrentControlSet\Services\zapret")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut hkey: isize = 0;
+    let mut disp: u32 = 0;
+    let ret = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut hkey,
+            &mut disp,
+        )
+    };
+
+    if ret != 0 || hkey == 0 {
+        return false;
+    }
+
+    let set_str = |name: &str, val: &str, reg_type: u32| {
+        let name_w: Vec<u16> = OsStr::new(name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let val_w: Vec<u16> = OsStr::new(val)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            RegSetValueExW(
+                hkey,
+                name_w.as_ptr(),
+                0,
+                reg_type,
+                val_w.as_ptr() as *const u8,
+                (val_w.len() * 2) as u32,
+            )
+        };
+    };
+
+    let set_dword = |name: &str, val: u32| {
+        let name_w: Vec<u16> = OsStr::new(name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            RegSetValueExW(
+                hkey,
+                name_w.as_ptr(),
+                0,
+                REG_DWORD,
+                &val as *const u32 as *const u8,
+                4,
+            )
+        };
+    };
+
+    let clean_path = full_bin_path.trim();
+    set_str("ImagePath", clean_path, REG_EXPAND_SZ);
+    set_str("DisplayName", "zapret", REG_SZ);
+    set_str(
+        "Description",
+        "Zapret DPI Network Optimization Service",
+        REG_SZ,
+    );
+    set_str("zapret-discord-youtube", strategy_name, REG_SZ);
+    set_dword("Start", 2); // Automatic
+    set_dword("Type", 0x10); // SERVICE_WIN32_OWN_PROCESS
+    set_dword("ErrorControl", 1); // SERVICE_ERROR_NORMAL
+
+    unsafe { RegCloseKey(hkey) };
+    true
+}
+
+#[cfg(not(windows))]
+pub fn write_service_registry(_full_bin_path: &str, _strategy_name: &str) -> bool {
+    true
+}
+
+/// Ensures Zapret service is running if installed in the system.
+pub fn ensure_zapret_service_running() -> bool {
+    let (running, _) = get_zapret_service_status();
+    if running {
+        return true;
+    }
+    let _ = win32::service_start("zapret");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (running_after, _) = get_zapret_service_status();
+    running_after
+}
+
+/// Discovers strategies, prompts or selects one, configures Windows service zapret, and starts it.
+pub fn cmd_install_strategy(base_dir: &Path, chosen_strategy: Option<&str>) -> bool {
+    ensure_admin(&["--menu".to_string()]);
+    if !is_admin() {
+        println!("\n[!] ОШИБКА: Для установки системной службы требуются права Администратора.");
+        return false;
+    }
+
+    let strategies = discover_zapret_strategies(base_dir);
+    if strategies.is_empty() {
+        println!("\n[!] Стратегии Zapret не найдены. Убедитесь, что папка 'presets' существует.");
+        return false;
+    }
+
+    let mut selected_name = String::new();
+    let mut selected_bat = PathBuf::new();
+
+    if let Some(chosen) = chosen_strategy {
+        let clean = chosen.trim().to_lowercase();
+        if let Ok(idx) = clean.parse::<usize>() {
+            if idx >= 1 && idx <= strategies.len() {
+                selected_name = strategies[idx - 1].0.clone();
+                selected_bat = strategies[idx - 1].1.clone();
+            }
+        } else {
+            for (name, path) in &strategies {
+                let name_low = name.to_lowercase();
+                if name_low == clean || name_low == format!("general ({})", clean) {
+                    selected_name = name.clone();
+                    selected_bat = path.clone();
+                    break;
+                }
+            }
+        }
+    }
+
+    if selected_bat.as_os_str().is_empty() {
+        println!("\n  ==================================================");
+        println!("  ВЫБОР СТРАТЕГИИ ZAPRET ДЛЯ УСТАНОВКИ СЛУЖБЫ");
+        println!("  ==================================================");
+        for (i, (name, _)) in strategies.iter().enumerate() {
+            println!("     {:2}. {}", i + 1, name);
+        }
+        println!("  --------------------------------------------------");
+        println!("      0. Отмена");
+        println!();
+        print!(
+            "  Выберите стратегию [1-{}, 0 для отмены]: ",
+            strategies.len()
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        let mut input = String::new();
+        match std::io::stdin().read_line(&mut input) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+
+        let trimmed = input.trim();
+        if trimmed == "0" || trimmed.is_empty() {
+            return false;
+        }
+
+        if let Ok(idx) = trimmed.parse::<usize>() {
+            if idx >= 1 && idx <= strategies.len() {
+                selected_name = strategies[idx - 1].0.clone();
+                selected_bat = strategies[idx - 1].1.clone();
+            } else {
+                println!("[!] Неверный номер стратегии.");
+                return false;
+            }
+        } else {
+            let clean = trimmed.to_lowercase();
+            for (name, path) in &strategies {
+                let name_low = name.to_lowercase();
+                if name_low == clean || name_low == format!("general ({})", clean) {
+                    selected_name = name.clone();
+                    selected_bat = path.clone();
+                    break;
+                }
+            }
+            if selected_bat.as_os_str().is_empty() {
+                println!("[!] Стратегия не найдена.");
+                return false;
+            }
+        }
+    }
+
+    let winws_candidates = [
+        base_dir.join("bin").join("winws.exe"),
+        base_dir.join("winws.exe"),
+    ];
+
+    let mut winws_exe = None;
+    for c in &winws_candidates {
+        if c.exists() {
+            winws_exe = Some(c.clone());
+            break;
+        }
+    }
+
+    let winws_exe = match winws_exe {
+        Some(exe) => exe,
+        None => {
+            println!("[!] winws.exe не найден в папке bin. Установка невозможна.");
+            return false;
+        }
+    };
+
+    let bin_dir = winws_exe.parent().unwrap_or(base_dir);
+    let lists_dir = base_dir.join("lists");
+    if !lists_dir.exists() {
+        println!("[!] Папка lists не найдена: {}", lists_dir.display());
+        return false;
+    }
+
+    println!("\n[*] Применение стратегии: {}", selected_name);
+    let parsed_args = match parse_strategy_args(&selected_bat, bin_dir, &lists_dir) {
+        Some(args) => args,
+        None => {
+            println!("[!] Не удалось разобрать параметры запуска из файла стратегии.");
+            return false;
+        }
+    };
+
+    let full_bin_path = format!("\"{}\" {}", winws_exe.to_string_lossy(), parsed_args);
+
+    // Gracefully stop service via SCM first to avoid Event ID 7031 crash logs
+    stop_zapret_service_gracefully();
+
+    // Create base service if not already present
+    let _ = Command::new("sc")
+        .args(&[
+            "create",
+            "zapret",
+            "binPath=",
+            "%SystemRoot%\\System32\\cmd.exe",
+            "DisplayName=",
+            "zapret",
+            "start=",
+            "auto",
+        ])
+        .output();
+
+    // Directly write service configuration to registry without sc.exe command line truncation
+    if !write_service_registry(&full_bin_path, &selected_name) {
+        println!("[!] Ошибка записи параметров службы в реестр Windows.");
+        return false;
+    }
+
+    // Configure service dependencies and failure recovery
+    let _ = Command::new("sc")
+        .args(&["config", "zapret", "depend=", "BFE/Tcpip"])
+        .output();
+    let _ = Command::new("sc")
+        .args(&[
+            "failure",
+            "zapret",
+            "reset=",
+            "86400",
+            "actions=",
+            "restart/2000/restart/5000//",
+        ])
+        .output();
+
+    // Start service via Win32 SCM
+    let started_now = win32::service_start("zapret");
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    // Recheck status
+    let (running, _) = get_zapret_service_status();
+    if running {
+        println!(
+            "[+] Служба Zapret со стратегией [{}] успешно установлена и запущена!",
+            selected_name
+        );
+        true
+    } else if started_now {
+        println!(
+            "[+] Служба Zapret со стратегией [{}] запускается...",
+            selected_name
+        );
+        true
+    } else {
+        println!(
+            "[!] Служба зарегистрирована со стратегией [{}]. Запуск процесса...",
+            selected_name
+        );
+        true
+    }
+}
+
+/// Stops and removes Zapret Windows service and cleans up WinDivert drivers.
+pub fn cmd_remove_strategy() -> bool {
+    ensure_admin(&["--menu".to_string()]);
+    if !is_admin() {
+        println!("\n[!] ОШИБКА: Для удаления службы Windows требуются права Администратора.");
+        return false;
+    }
+
+    println!("\n[*] Остановка и удаление службы Zapret...");
+    stop_zapret_service_gracefully();
+    let _ = win32::service_delete("zapret");
+
+    println!("[+] Служба Zapret успешно остановлена и удалена.");
+    true
+}
+
+/// Unified Uninstaller: stops & removes service, stops bridge daemon, and clears proxy settings.
+pub fn cmd_remove_all(base_dir: &Path) -> bool {
+    ensure_admin(&["--menu".to_string()]);
+    if !is_admin() {
+        println!("\n[!] Ошибка: Для удаления служб требуются права Администратора.");
+        return false;
+    }
+
+    println!("\n[*] Остановка и удаление всех служб...");
+    cmd_remove_strategy();
+    cmd_stop(base_dir);
+    cmd_fix_proxy();
+    for rule_name in [
+        "Zapret TV Bridge (8080)",
+        "Zapret TV Bridge SOCKS5 (1080)",
+        "Zapret TV Bridge Telegram (1443)",
+        "Zapret TV Bridge - Block QUIC (UDP 443)",
+    ] {
+        let _ = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={rule_name}"),
+            ])
+            .output();
+    }
+    println!("\n[+] Все службы успешно остановлены и удалены из системы.\n");
+    true
+}
+
+/// Starts the bridge daemon in a fully detached background process.
+/// If port 8080 is held by an instance from another folder (`pid == None`), replaces it cleanly.
+pub fn cmd_start(base_dir: &Path) -> bool {
+    let (running, pid) = is_bridge_running(base_dir);
+    if running {
+        if let Some(p) = pid {
+            println!("[i] Zapret TV Bridge уже запущен в фоне [PID: {}].", p);
+            return true;
+        }
+        println!("[*] Обнаружен шлюз от другой/предыдущей папки на порту 8080, перезапуск из текущей папки...");
+        cmd_stop(base_dir);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
+
+    println!("[*] Запуск Zapret TV & Mobile Bridge в тихом фоновом режиме...");
+    let exe = std::env::current_exe().unwrap_or_else(|_| base_dir.join("ZapretTVBridge.exe"));
+
+    #[cfg(windows)]
+    {
+        let res = Command::new(&exe)
+            .arg("--daemon")
+            .current_dir(base_dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+            .spawn();
+
+        match res {
+            Ok(child) => {
+                let child_pid = child.id();
+                // Wait briefly for daemon to initialize sockets
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let (now_running, _) = is_bridge_running(base_dir);
+                    if now_running {
+                        println!("[+] Сервис успешно запущен в фоне [PID: {}].", child_pid);
+                        return true;
+                    }
+                }
+                println!("[+] Процесс запущен [PID: {}].", child_pid);
+                true
+            }
+            Err(e) => {
+                println!("[!] Ошибка запуска фонового процесса: {}", e);
+                false
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let res = Command::new(&exe)
+            .arg("--daemon")
+            .current_dir(base_dir)
+            .spawn();
+        res.is_ok()
+    }
+}
+
+/// Stops all running bridge daemon processes and cleans up PID/IP files.
+pub fn cmd_stop(base_dir: &Path) -> bool {
+    let pid_file = base_dir.join("tv_proxy.pid");
+    let ip_file = base_dir.join("tv_proxy.ip");
+
+    if pid_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pid_file) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                win32::kill_pid(pid);
+            }
+        }
+        let _ = std::fs::remove_file(&pid_file);
+    }
+    if ip_file.exists() {
+        let _ = std::fs::remove_file(&ip_file);
+    }
+
+    // Stop Telegram proxy (tgwsproxy)
+    let tg_pid_file = base_dir.join("tg_proxy.pid");
+    if tg_pid_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&tg_pid_file) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                win32::kill_pid(pid);
+            }
+        }
+        let _ = std::fs::remove_file(&tg_pid_file);
+    }
+
+    win32::kill_by_name("tgwsproxy.exe", None);
+
+    // Terminate any other ZapretTVBridge instances except current process via Win32 snapshot
+    let curr_pid = std::process::id();
+    win32::kill_by_name("ZapretTVBridge_old.exe", None);
+    let old_file = base_dir.join("ZapretTVBridge_old.exe");
+    if old_file.exists() {
+        let _ = std::fs::remove_file(&old_file);
+    }
+    win32::kill_by_name("ZapretTVBridge.exe", Some(curr_pid));
+
+    println!("[+] Zapret TV Bridge успешно остановлен.");
+    true
+}
+
+/// Restarts the bridge background daemon and refreshes services.
+pub fn cmd_restart(base_dir: &Path) -> bool {
+    println!("[*] Перезапуск сервисов...");
+    let (zapret_running, _) = get_zapret_service_status();
+    if zapret_running {
+        println!("[*] Перезапуск службы Zapret для обновления списков...");
+        let _ = win32::service_stop("zapret");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = win32::service_start("zapret");
+    }
+    cmd_stop(base_dir);
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    cmd_start(base_dir)
+}
+
+/// Displays bridge status, IP, port, and client setup links.
+pub fn cmd_status(base_dir: &Path) {
+    let (is_running, pid) = is_bridge_running(base_dir);
+    let (zapret_running, zapret_strat) = get_zapret_service_status();
+    let startup_enabled = is_startup_enabled();
+    let local_ip = pac::get_local_ip();
+
+    let secret_file = base_dir.join("tg_secret.txt");
+    let tg_secret = std::fs::read_to_string(&secret_file)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    println!();
+    println!("  ==================================================");
+    println!("  ZAPRET TV & MOBILE BRIDGE -- СТАТУС СЕРВИСА");
+    println!("  ==================================================");
+
+    if zapret_running {
+        let strat_str = if !zapret_strat.is_empty() {
+            format!(" [{}]", zapret_strat)
+        } else {
+            "".to_string()
+        };
+        println!("  Служба Zapret:  АКТИВНА{}", strat_str);
+    } else {
+        println!("  Служба Zapret:  ОСТАНОВЛЕНА");
+    }
+
+    if is_running {
+        let pid_str = if let Some(p) = pid {
+            format!(" [PID: {}]", p)
+        } else {
+            "".to_string()
+        };
+        println!("  Мост [Bridge]:  АКТИВЕН{}", pid_str);
+        println!("  Адрес:          http://{}:8080/", local_ip);
+        println!("  PAC URL:        http://{}:8080/proxy.pac", local_ip);
+        println!("  Smart TV:       IP {}  Порт 8080", local_ip);
+        if !tg_secret.is_empty() {
+            let link_secret = format_telegram_secret(&tg_secret);
+            let (tg_running, tg_pid) = is_tg_proxy_running(base_dir);
+            let tg_tag = if tg_running {
+                if let Some(p) = tg_pid {
+                    format!(" [АКТИВЕН - PID: {}]", p)
+                } else {
+                    " [АКТИВЕН]".to_string()
+                }
+            } else {
+                " [ОСТАНОВЛЕН]".to_string()
+            };
+            println!(
+                "  Telegram (tgwsproxy): tg://proxy?server={}&port=1443&secret={}{}",
+                local_ip, link_secret, tg_tag
+            );
+        }
+    } else {
+        println!("  Мост [Bridge]:  ОСТАНОВЛЕН [Фоновый процесс не запущен]");
+        println!("  Локальный IP:   {}", local_ip);
+    }
+
+    println!(
+        "  Автозагрузка:   {}",
+        if startup_enabled {
+            "[Включена]"
+        } else {
+            "[Отключена]"
+        }
+    );
+    println!("  --------------------------------------------------");
+    println!();
+}
+
+/// Toggles Windows autostart.
+pub fn cmd_toggle_startup(base_dir: &Path) {
+    let enabled = is_startup_enabled();
+    cmd_startup(!enabled, base_dir);
+}
+
+/// Configures complete Windows Startup for both Zapret service and Bridge.
+pub fn cmd_startup(enable: bool, base_dir: &Path) {
+    let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let target_dir = PathBuf::from(&local_appdata).join("ZapretTVBridge");
+    let _ = std::fs::create_dir_all(&target_dir);
+    let vbs_path = target_dir.join("bridge_autostart.vbs");
+
+    // Always purge stale Task Scheduler / Startup / Run entries from older folders first
+    cleanup_legacy_startup_entries(base_dir);
+
+    if !enable {
+        println!("[+] Автозагрузка Windows отключена.");
+        return;
+    }
+
+    // Configure zapret service for AUTO start if running with admin rights
+    let _ = Command::new("sc")
+        .args(&["config", "zapret", "start=", "auto"])
+        .output();
+    let _ = Command::new("sc")
+        .args(&["config", "zapret", "depend=", "BFE/Tcpip"])
+        .output();
+
+    let norm_base = base_dir
+        .to_string_lossy()
+        .trim_end_matches('\\')
+        .to_string();
+    let vbs_content = format!(
+        "' Zapret TV & Mobile Bridge -- Silent AutoStart Launcher\r\n\
+         Option Explicit\r\n\
+         Dim fso, shell, curDir, objWMIService, colProcesses\r\n\
+         Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+         Set shell = CreateObject(\"WScript.Shell\")\r\n\
+         curDir = \"{}\"\r\n\
+         If Not fso.FolderExists(curDir) Then WScript.Quit\r\n\
+         shell.CurrentDirectory = curDir\r\n\
+         On Error Resume Next\r\n\
+         shell.Run \"sc start zapret\", 0, False\r\n\
+         Set objWMIService = GetObject(\"winmgmts:\\\\.\\root\\cimv2\")\r\n\
+         Set colProcesses = objWMIService.ExecQuery(\"Select * from Win32_Process Where Name = 'ZapretTVBridge.exe'\")\r\n\
+         If colProcesses.Count = 0 Then\r\n\
+             If fso.FileExists(curDir & \"\\bin\\ZapretTVBridge.exe\") Then\r\n\
+                 shell.Run \"\"\"\" & curDir & \"\\bin\\ZapretTVBridge.exe\"\" --daemon\", 0, False\r\n\
+             ElseIf fso.FileExists(curDir & \"\\ZapretTVBridge.exe\") Then\r\n\
+                 shell.Run \"\"\"\" & curDir & \"\\ZapretTVBridge.exe\"\" --daemon\", 0, False\r\n\
+             ElseIf fso.FileExists(curDir & \"\\bridge-rs\\target\\release\\ZapretTVBridge.exe\") Then\r\n\
+                 shell.Run \"\"\"\" & curDir & \"\\bridge-rs\\target\\release\\ZapretTVBridge.exe\"\" --daemon\", 0, False\r\n\
+             End If\r\n\
+         End If\r\n",
+        norm_base
+    );
+
+    let _ = std::fs::write(&vbs_path, &vbs_content);
+
+    let vbs_cmd = format!("wscript.exe \"{}\"", vbs_path.to_string_lossy());
+
+    // 1. Register in Task Scheduler with highest admin privileges (silent on logon)
+    let schtasks_res = Command::new("schtasks")
+        .args(&[
+            "/create",
+            "/tn",
+            "Zapret_TV_Bridge",
+            "/tr",
+            &vbs_cmd,
+            "/sc",
+            "onlogon",
+            "/rl",
+            "highest",
+            "/f",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    let task_ok = schtasks_res.map(|o| o.status.success()).unwrap_or(false);
+
+    // If Task Scheduler is active, remove HKCU Run to prevent duplicate double-starts on boot.
+    // If Task Scheduler failed (e.g. non-elevated), fallback to HKCU Run.
+    #[cfg(windows)]
+    {
+        if task_ok {
+            win32::reg_delete_value(
+                win32::HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                "ZapretTVBridge",
+            );
+        } else {
+            win32::reg_set_sz(
+                win32::HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                "ZapretTVBridge",
+                &vbs_cmd,
+            );
+        }
+    }
+
+    // Ensure zapret service is started via Win32 SCM
+    let _ = win32::service_start("zapret");
+    cmd_start(base_dir);
+
+    println!("[+] Все службы успешно добавлены в автозагрузку Windows!");
+    println!("    При включении ПК автоматически запускаются и служба Zapret, и шлюз для ТВ.\n");
+}
+
+/// Adds Windows Firewall rules for HTTP proxy (8080), SOCKS5 (1080), and Telegram (1443) on private LAN networks.
+pub fn cmd_firewall() {
+    println!("[*] Настройка Брандмауэра Windows...");
+    let rules = [
+        ("Zapret TV Bridge (8080)", "8080"),
+        ("Zapret TV Bridge SOCKS5 (1080)", "1080"),
+        ("Zapret TV Bridge Telegram (1443)", "1443"),
+    ];
+
+    for (name, port) in &rules {
+        let rule_arg = format!("name={name}");
+        let _ = Command::new("netsh")
+            .args(["advfirewall", "firewall", "delete", "rule", &rule_arg])
+            .output();
+        let _ = Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &rule_arg,
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                &format!("localport={port}"),
+                "profile=private",
+            ])
+            .output();
+    }
+
+    // Outbound rule: Block UDP 443 (QUIC / HTTP3) to prevent video streaming buffering stalls
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            "name=Zapret TV Bridge - Block QUIC (UDP 443)",
+        ])
+        .output();
+    let _ = Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            "name=Zapret TV Bridge - Block QUIC (UDP 443)",
+            "dir=out",
+            "action=block",
+            "protocol=UDP",
+            "remoteport=443",
+        ])
+        .output();
+
+    println!("[+] Правила Брандмауэра успешно добавлены (порты 8080, 1080, 1443 открыты для домашней сети, UDP 443/QUIC ограничен для плавного стриминга).");
+}
+
+/// Clears Windows System Proxy for direct system connection.
+pub fn cmd_fix_proxy() {
+    #[cfg(windows)]
+    {
+        win32::reg_delete_value(
+            win32::HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "AutoConfigURL",
+        );
+        win32::reg_set_dword(
+            win32::HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyEnable",
+            0,
+        );
+    }
+
+    println!("[+] Системный прокси Windows очищен (прямое подключение).");
+}
+
+/// Opens URL in default system browser.
+pub fn cmd_open_browser(url: &str) {
+    win32::open_url(url);
+}
+
+/// Performs network latency diagnostics tests.
+pub fn cmd_test() {
+    println!();
+    println!("  ==================================================");
+    println!("  ДИАГНОСТИКА СЕТИ И DNS-OVER-HTTPS (DoH)");
+    println!("  ==================================================");
+
+    let targets = [
+        ("Cloudflare DNS (1.1.1.1:53)", "1.1.1.1:53"),
+        ("Google DNS (8.8.8.8:53)", "8.8.8.8:53"),
+        ("Local Gateway / Proxy (127.0.0.1:8080)", "127.0.0.1:8080"),
+    ];
+
+    for (name, addr_str) in &targets {
+        if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+            let t0 = std::time::Instant::now();
+            match std::net::TcpStream::connect_timeout(
+                &addr,
+                std::time::Duration::from_millis(1500),
+            ) {
+                Ok(_) => {
+                    let lat = t0.elapsed().as_secs_f64() * 1000.0;
+                    println!("  [OK]   {:<38}  Задержка: {:.1} мс", name, lat);
+                }
+                Err(e) => {
+                    println!("  [FAIL] {:<38}  Ошибка: {}", name, e);
+                }
+            }
+        }
+    }
+    println!("  --------------------------------------------------");
+    println!();
+}
+
+/// Chromium-based browser profile target definition.
+struct BrowserTarget {
+    name: &'static str,
+    relative_path: &'static str,
+    is_roaming: bool,
+}
+
+const BROWSER_TARGETS: &[BrowserTarget] = &[
+    BrowserTarget {
+        name: "Microsoft Edge",
+        relative_path: r"Microsoft\Edge\User Data\Local State",
+        is_roaming: false,
+    },
+    BrowserTarget {
+        name: "Google Chrome",
+        relative_path: r"Google\Chrome\User Data\Local State",
+        is_roaming: false,
+    },
+    BrowserTarget {
+        name: "Brave Browser",
+        relative_path: r"BraveSoftware\Brave-Browser\User Data\Local State",
+        is_roaming: false,
+    },
+    BrowserTarget {
+        name: "Yandex Browser",
+        relative_path: r"Yandex\YandexBrowser\User Data\Local State",
+        is_roaming: false,
+    },
+    BrowserTarget {
+        name: "Vivaldi",
+        relative_path: r"Vivaldi\User Data\Local State",
+        is_roaming: false,
+    },
+    BrowserTarget {
+        name: "Chromium",
+        relative_path: r"Chromium\User Data\Local State",
+        is_roaming: false,
+    },
+    BrowserTarget {
+        name: "Opera",
+        relative_path: r"Opera Software\Opera Stable\Local State",
+        is_roaming: true,
+    },
+    BrowserTarget {
+        name: "Opera GX",
+        relative_path: r"Opera Software\Opera GX Stable\Local State",
+        is_roaming: true,
+    },
+];
+
+/// Updates a Chromium Local State JSON string to ensure `enable-parallel-downloading@1`
+/// is present in `browser.enabled_labs_experiments`.
+/// Returns `(updated_json_string, modified_bool)`.
+pub fn enable_parallel_downloading_in_json(
+    content: &str,
+) -> Result<(String, bool), serde_json::Error> {
+    let mut val: serde_json::Value = serde_json::from_str(content)?;
+    let mut modified = false;
+
+    if let serde_json::Value::Object(ref mut root) = val {
+        let browser_entry = root
+            .entry("browser")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        if let serde_json::Value::Object(ref mut browser_map) = browser_entry {
+            let experiments_entry = browser_map
+                .entry("enabled_labs_experiments")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+
+            if let serde_json::Value::Array(ref mut exp_arr) = experiments_entry {
+                let initial_len = exp_arr.len();
+                exp_arr.retain(|x| {
+                    x.as_str() != Some("enable-parallel-downloading@2")
+                        && x.as_str() != Some("enable-quic@1")
+                });
+                if exp_arr.len() != initial_len {
+                    modified = true;
+                }
+
+                if !exp_arr
+                    .iter()
+                    .any(|x| x.as_str() == Some("enable-parallel-downloading@1"))
+                {
+                    exp_arr.push(serde_json::Value::String(
+                        "enable-parallel-downloading@1".to_string(),
+                    ));
+                    modified = true;
+                }
+
+                if !exp_arr.iter().any(|x| x.as_str() == Some("enable-quic@2")) {
+                    exp_arr.push(serde_json::Value::String("enable-quic@2".to_string()));
+                    modified = true;
+                }
+            }
+        }
+    }
+
+    if modified {
+        let new_content = serde_json::to_string(&val)?;
+        Ok((new_content, true))
+    } else {
+        Ok((content.to_string(), false))
+    }
+}
+
+/// Scans installed Chromium-based browsers across all user profiles and automatically enables
+/// multi-threaded parallel downloading (`enable-parallel-downloading@1`) to eliminate throughput drops.
+pub fn cmd_optimize_browsers() -> usize {
+    println!();
+    println!("  ==================================================");
+    println!("  ОПТИМИЗАЦИЯ СКОРОСТИ ЗАГРУЗКИ В БРАУЗЕРАХ");
+    println!("  (Параллельная многопоточная загрузка Chromium)");
+    println!("  ==================================================");
+
+    let mut roots: Vec<(PathBuf, bool)> = Vec::new();
+
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        roots.push((PathBuf::from(local_appdata), false));
+    }
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        roots.push((PathBuf::from(appdata), true));
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(entries) = std::fs::read_dir(r"C:\Users") {
+            for entry in entries.flatten() {
+                let user_dir = entry.path();
+                if user_dir.is_dir() {
+                    let local = user_dir.join("AppData").join("Local");
+                    if local.is_dir() {
+                        roots.push((local, false));
+                    }
+                    let roaming = user_dir.join("AppData").join("Roaming");
+                    if roaming.is_dir() {
+                        roots.push((roaming, true));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut processed_paths = std::collections::HashSet::new();
+    let mut modified_count = 0;
+    let mut found_count = 0;
+
+    for (root_dir, is_roaming) in &roots {
+        for target in BROWSER_TARGETS {
+            if target.is_roaming == *is_roaming {
+                let state_file = root_dir.join(target.relative_path);
+                if state_file.is_file() {
+                    let canonical = state_file
+                        .canonicalize()
+                        .unwrap_or_else(|_| state_file.clone());
+                    if !processed_paths.insert(canonical) {
+                        continue;
+                    }
+
+                    found_count += 1;
+                    match std::fs::read_to_string(&state_file) {
+                        Ok(content) => match enable_parallel_downloading_in_json(&content) {
+                            Ok((new_content, changed)) => {
+                                if changed {
+                                    let bak_file = state_file.with_extension("bak");
+                                    let _ = std::fs::copy(&state_file, &bak_file);
+                                    if std::fs::write(&state_file, new_content).is_ok() {
+                                        println!("  [+] {}: многопоточная параллельная загрузка успешно включена!", target.name);
+                                        modified_count += 1;
+                                    } else {
+                                        println!(
+                                            "  [!] {}: ошибка записи файла Local State",
+                                            target.name
+                                        );
+                                    }
+                                } else {
+                                    println!(
+                                        "  [*] {}: многопоточная загрузка уже была активна",
+                                        target.name
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                println!("  [!] {}: ошибка структуры JSON ({})", target.name, e);
+                            }
+                        },
+                        Err(e) => {
+                            println!("  [!] {}: ошибка чтения файла ({})", target.name, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if found_count == 0 {
+        println!("  [*] Совместимые Chromium браузеры не найдены.");
+    } else {
+        println!("  --------------------------------------------------");
+        println!(
+            "  [+] Обработано браузеров: {}, оптимизировано новых: {}",
+            found_count, modified_count
+        );
+
+        #[cfg(windows)]
+        {
+            let browser_exes = [
+                "msedge.exe",
+                "chrome.exe",
+                "brave.exe",
+                "browser.exe",
+                "opera.exe",
+                "vivaldi.exe",
+            ];
+            let running = win32::find_running_exes(&browser_exes);
+            if !running.is_empty() {
+                println!();
+                println!(
+                    "  [!] Внимание: Обнаружены открытые браузеры ({}).",
+                    running.join(", ")
+                );
+                println!(
+                    "      Для вступления изменений в силу закройте и снова откройте браузер."
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Configure Post-Quantum TLS policy (disables Kyber to allow TLS ClientHello desynchronization)
+            for pol_key in [
+                r"SOFTWARE\Policies\Microsoft\Edge",
+                r"SOFTWARE\Policies\Google\Chrome",
+            ] {
+                win32::reg_set_dword(
+                    win32::HKEY_LOCAL_MACHINE,
+                    pol_key,
+                    "PostQuantumKeyAgreementEnabled",
+                    0,
+                );
+                // Remove DoH policies to preserve local ISP CDN caching for video streaming
+                win32::reg_delete_value(win32::HKEY_LOCAL_MACHINE, pol_key, "DnsOverHttpsMode");
+                win32::reg_delete_value(
+                    win32::HKEY_LOCAL_MACHINE,
+                    pol_key,
+                    "DnsOverHttpsTemplates",
+                );
+            }
+        }
+    }
+    println!("  --------------------------------------------------\n");
+    modified_count
+}
+
+fn normalize_domain(raw: &str) -> Option<String> {
+    let mut d = raw.trim().to_ascii_lowercase();
+    if let Some(rest) = d.strip_prefix("https://") {
+        d = rest.to_string();
+    } else if let Some(rest) = d.strip_prefix("http://") {
+        d = rest.to_string();
+    }
+    if let Some(idx) = d.find([':', '/']) {
+        d.truncate(idx);
+    }
+    let d = d.trim_matches('.').to_string();
+    if d.is_empty() || !d.contains('.') {
+        return None;
+    }
+    let labels: Vec<&str> = d.split('.').collect();
+    if labels.len() == 4
+        && labels
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    const IGNORED: &[&str] = &[
+        ".local",
+        ".lan",
+        ".home",
+        ".internal",
+        ".in-addr.arpa",
+        ".ip6.arpa",
+    ];
+    if IGNORED.iter().any(|suffix| d.ends_with(suffix)) {
+        return None;
+    }
+    Some(d)
+}
+
+fn load_domain_file(path: &Path, into: &mut std::collections::HashSet<String>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(domain) = normalize_domain(line) {
+            into.insert(domain);
+        }
+    }
+}
+
+fn domains_from_packed_json(path: &Path) -> std::collections::HashSet<String> {
+    let mut domains = std::collections::HashSet::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return domains;
+    };
+    let Ok(data) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text) else {
+        println!("  [!] Не удалось прочитать {}", path.display());
+        return domains;
+    };
+    for (key, value) in data {
+        let Ok(width) = key.parse::<usize>() else {
+            continue;
+        };
+        if width == 0 {
+            continue;
+        }
+        let Some(packed) = value.as_str() else {
+            continue;
+        };
+        let mut offset = 0;
+        while offset + width <= packed.len()
+            && packed.is_char_boundary(offset)
+            && packed.is_char_boundary(offset + width)
+        {
+            let slice = &packed[offset..offset + width];
+            offset += width;
+            if let Some(domain) = normalize_domain(slice.trim()) {
+                domains.insert(domain);
+            }
+        }
+    }
+    domains
+}
+
+/// Writes `lists/list-general.txt` from the local rule database. No Python.
+pub fn sync_hostlists(base_dir: &Path) -> std::io::Result<usize> {
+    let lists_dir = base_dir.join("lists");
+    std::fs::create_dir_all(&lists_dir)?;
+    let mut exclude = std::collections::HashSet::new();
+    load_domain_file(&lists_dir.join("list-exclude.txt"), &mut exclude);
+    load_domain_file(&lists_dir.join("list-exclude-user.txt"), &mut exclude);
+
+    let mut domains = std::collections::HashSet::new();
+    load_domain_file(&lists_dir.join("list-general.txt"), &mut domains);
+    let kept = domains.len();
+    println!("  [*] Сохранено {kept} существующих доменов из list-general.txt");
+    let from_json = domains_from_packed_json(&base_dir.join("routing_rules.json"));
+    println!(
+        "  [+] Из локальной базы извлечено {} доменов",
+        from_json.len()
+    );
+    domains.extend(from_json);
+    domains.retain(|d| !exclude.contains(d));
+
+    let mut cleaned: Vec<String> = domains.into_iter().collect();
+    cleaned.sort();
+    let gen_path = lists_dir.join("list-general.txt");
+    let tmp_path = lists_dir.join("list-general.txt.tmp");
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writeln!(
+            writer,
+            "# Auto-generated comprehensive domain list by Zapret TV Bridge"
+        )?;
+        writeln!(writer, "# Total domains: {}", cleaned.len())?;
+        writeln!(writer)?;
+        for domain in &cleaned {
+            writeln!(writer, "{domain}")?;
+        }
+        writer.flush()?;
+    }
+    std::fs::rename(&tmp_path, &gen_path)?;
+    Ok(cleaned.len())
+}
+
+/// Synchronizes the rule database and restarts the Zapret service. Does not call Python.
+pub fn cmd_sync_rules(base_dir: &Path) {
+    println!();
+    println!("  ==================================================");
+    println!("  СИНХРОНИЗАЦИЯ БАЗЫ ПРАВИЛ (660,000+ ДОМЕНОВ)");
+    println!("  ==================================================");
+    println!("  [*] Запуск синка базы правил...");
+
+    match sync_hostlists(base_dir) {
+        Ok(count) => {
+            println!("  [+] База правил обновлена: {count} доменов");
+            println!("  [*] Перезапуск службы Zapret для применения новых правил...");
+            stop_zapret_service_gracefully();
+            if win32::service_start("zapret") {
+                println!("  [+] Служба Zapret перезапущена.");
+            } else {
+                println!("  [!] Служба Zapret не запустилась. Списки уже записаны.");
+            }
+        }
+        Err(e) => println!("  [!] Не удалось записать списки: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_enable_parallel_downloading_empty_json() {
+        let raw = "{}";
+        let (updated, changed) = enable_parallel_downloading_in_json(raw).expect("should succeed");
+        assert!(changed);
+        let parsed: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        let exp = parsed["browser"]["enabled_labs_experiments"]
+            .as_array()
+            .unwrap();
+        assert_eq!(exp.len(), 2);
+        assert!(exp.iter().any(|v| v == "enable-parallel-downloading@1"));
+        assert!(exp.iter().any(|v| v == "enable-quic@2"));
+    }
+
+    #[test]
+    fn test_sync_hostlists_merges_packed_json_without_python() {
+        let dir = std::env::temp_dir().join(format!("ztb-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lists")).unwrap();
+        std::fs::write(dir.join("lists").join("list-general.txt"), "keep.example\n").unwrap();
+        std::fs::write(dir.join("lists").join("list-exclude.txt"), "bad.example\n").unwrap();
+        std::fs::write(
+            dir.join("routing_rules.json"),
+            r#"{"11":"example.combad.example"}"#,
+        )
+        .unwrap();
+
+        let count = sync_hostlists(&dir).unwrap();
+        let text = std::fs::read_to_string(dir.join("lists").join("list-general.txt")).unwrap();
+        assert_eq!(count, 2);
+        assert!(text.contains("keep.example"));
+        assert!(text.contains("example.com"));
+        assert!(!text.contains("bad.example"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_normalize_domain_rejects_addresses_and_local_names() {
+        assert_eq!(
+            normalize_domain("https://YouTube.com/watch"),
+            Some("youtube.com".to_string())
+        );
+        assert_eq!(
+            normalize_domain("  Example.COM. "),
+            Some("example.com".to_string())
+        );
+        assert_eq!(normalize_domain("10.1.2.3"), None);
+        assert_eq!(normalize_domain("printer.local"), None);
+        assert_eq!(normalize_domain("nosuffix"), None);
+    }
+
+    #[test]
+    fn test_enable_parallel_downloading_already_present() {
+        let raw = r#"{"browser":{"enabled_labs_experiments":["enable-parallel-downloading@1","enable-quic@2"]}}"#;
+        let (_updated, changed) = enable_parallel_downloading_in_json(raw).expect("should succeed");
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_enable_parallel_downloading_replaces_disabled() {
+        let raw = r#"{"browser":{"enabled_labs_experiments":["enable-parallel-downloading@2","enable-quic@1","other-flag@1"]}}"#;
+        let (updated, changed) = enable_parallel_downloading_in_json(raw).expect("should succeed");
+        assert!(changed);
+        let parsed: serde_json::Value = serde_json::from_str(&updated).unwrap();
+        let exp = parsed["browser"]["enabled_labs_experiments"]
+            .as_array()
+            .unwrap();
+        assert_eq!(exp.len(), 3);
+        assert!(exp.iter().any(|v| v == "enable-parallel-downloading@1"));
+        assert!(!exp.iter().any(|v| v == "enable-parallel-downloading@2"));
+        assert!(exp.iter().any(|v| v == "enable-quic@2"));
+        assert!(!exp.iter().any(|v| v == "enable-quic@1"));
+        assert!(exp.iter().any(|v| v == "other-flag@1"));
+    }
+}

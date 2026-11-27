@@ -1,0 +1,21 @@
+domain.example.abc
+
+cloudcode-pa.googleapis.com
+daily-cloudcode-pa.googleapis.com
+geohide.ru
+dns-ai.ru
+chatgpt.com
+openai.com
+anthropic.com
+claude.ai
+
+# GitHub full-speed direct exclusion
+github.com
+github.io
+githubassets.com
+githubusercontent.com
+
+# Anti-Cheat and Game Security Services
+battleye.com
+cdn.battleye.com
+battleye.becdn.net

@@ -1,0 +1,2 @@
+# Custom user target domains (one per line)
+domain.example.abc
